@@ -1,0 +1,287 @@
+using Test
+using Gen
+using GenVariableElimination
+
+# TODO: these tests poke around at the guts of internal data structures
+# the data structures should be refactored and perhaps
+# tests should be replaced with higher level tests of the API
+
+conditional_dist = GenVariableElimination.conditional_dist
+addr_to_idx = GenVariableElimination.addr_to_idx
+idx_to_var_node = GenVariableElimination.idx_to_var_node
+idx_to_value = GenVariableElimination.idx_to_value
+value_to_idx = GenVariableElimination.value_to_idx
+num_values = GenVariableElimination.num_values
+FactorNode = GenVariableElimination.FactorNode
+factor_nodes = GenVariableElimination.factor_nodes
+vars = GenVariableElimination.vars
+factor_value = GenVariableElimination.factor_value
+eliminate = GenVariableElimination.eliminate
+
+@gen function foo()
+    x ~ bernoulli(0.6)
+    y ~ bernoulli(x ? 0.2 : 0.9)
+    z ~ bernoulli((x && y) ? 0.4 : 0.9)
+    w ~ bernoulli(z ? 0.4 : 0.5)
+end
+
+function test_node(fg, addr)
+    node = idx_to_var_node(fg, addr_to_idx(fg, addr))
+    @test node.addr == addr
+    @test num_values(node) == 2
+    @test idx_to_value(node, 1) == true
+    @test idx_to_value(node, 2) == false
+    @test value_to_idx(node, true) == 1
+    @test value_to_idx(node, false) == 2
+end
+
+normed(arr) = arr / sum(arr)
+
+function test_factor_f1(fg, all_factors)
+    f1 = first(filter((fn) -> (
+        length(vars(fn)) == 1 &&
+        addr_to_idx(fg, :x) in vars(fn)), all_factors))
+    
+    f1_xtrue = factor_value(fg, f1, Dict(addr_to_idx(fg, :x) => true))
+    f1_xfalse = factor_value(fg, f1, Dict(addr_to_idx(fg, :x) => false))
+    F = [f1_xtrue, f1_xfalse]
+    @test isapprox(normed(F), normed([0.6, 0.4]))
+end
+
+function test_factor_f2(fg, all_factors)
+    f2 = first(filter((fn) -> (
+        length(vars(fn)) == 2 &&
+        addr_to_idx(fg, :x) in vars(fn) &&
+        addr_to_idx(fg, :y) in vars(fn)), all_factors))
+    f2_xtrue_ytrue = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true))
+    f2_xtrue_yfalse = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false))
+    f2_xfalse_ytrue = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true))
+    f2_xfalse_yfalse = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false))
+    F = [f2_xtrue_ytrue, f2_xtrue_yfalse, f2_xfalse_ytrue, f2_xfalse_yfalse]
+    @test isapprox(normed(F), normed([0.2, 0.8, 0.9, 0.1]))
+end
+
+function test_factor_f3(fg, all_factors)
+    f3 = first(filter((fn) -> (
+        length(vars(fn)) == 3 &&
+        addr_to_idx(fg, :x) in vars(fn) &&
+        addr_to_idx(fg, :y) in vars(fn) &&
+        addr_to_idx(fg, :z) in vars(fn)), all_factors))
+    f3_true_true_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
+    f3_true_false_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
+    f3_false_true_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
+    f3_false_false_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
+    f3_true_true_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
+    f3_true_false_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
+    f3_false_true_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
+    f3_false_false_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
+    F = [f3_true_true_true, f3_true_false_true, f3_false_true_true, f3_false_false_true, f3_true_true_false, f3_true_false_false, f3_false_true_false, f3_false_false_false]
+    @test isapprox(normed(F), normed([
+        0.4, 0.9, 0.9, 0.9,# z true
+        0.6, 0.1, 0.1, 0.1# z false
+    ]))
+end
+
+function test_factor_f4(fg, all_factors)
+    f4 = first(filter((fn) -> (
+        length(vars(fn)) == 2 &&
+        addr_to_idx(fg, :z) in vars(fn) &&
+        addr_to_idx(fg, :w) in vars(fn)), all_factors))
+    f4_xtrue_ytrue = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => true, addr_to_idx(fg, :w) => true))
+    f4_xtrue_yfalse = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => true, addr_to_idx(fg, :w) => false))
+    f4_xfalse_ytrue = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => false, addr_to_idx(fg, :w) => true))
+    f4_xfalse_yfalse = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => false, addr_to_idx(fg, :w) => false))
+    F = [f4_xtrue_ytrue, f4_xtrue_yfalse, f4_xfalse_ytrue, f4_xfalse_yfalse]
+    @test isapprox(normed(F), normed([0.4, 0.6, 0.5, 0.5]))
+end
+
+function test_factor_f5(fg, all_factors)
+    f = first(filter((fn) -> (
+        length(vars(fn)) == 1 &&
+        addr_to_idx(fg, :z) in vars(fn)), all_factors))
+    f_true = factor_value(fg, f, Dict(addr_to_idx(fg, :z) => true))
+    f_false = factor_value(fg, f, Dict(addr_to_idx(fg, :z) => false))
+    F = [f_true, f_false]
+    @test isapprox(normed(F), normed([0.4 + 0.6, 0.5 + 0.5]))
+end
+
+function test_factor_f6(fg, all_factors)
+    f = first(filter((fn) -> (
+        length(vars(fn)) == 2 &&
+        addr_to_idx(fg, :y) in vars(fn) &&
+        addr_to_idx(fg, :z) in vars(fn)), all_factors))
+    f_true_true = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
+    f_true_false = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
+    f_false_true = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
+    f_false_false = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
+    F = [f_true_true, f_true_false, f_false_true, f_false_false]
+    @test isapprox(normed(F), normed([
+        # x=true         # x=false
+        (0.6 * 0.2 * 0.4) + (0.4 * 0.9 * 0.9), # y=true, z=true,
+        (0.6 * 0.2 * 0.6) + (0.4 * 0.9 * 0.1),# y=true, z=false,
+        (0.6 * 0.8 * 0.9) + (0.4 * 0.1 * 0.9),# y=false, z=true,
+        (0.6 * 0.8 * 0.1) + (0.4 * 0.1 * 0.1)# y=false, z=false
+    ]))
+end
+
+
+@testset "compiling factor graph from trace" begin
+
+    # x 
+    # y
+    # z
+    # w
+
+    # f1: factor for x
+    # f2: factor between x and y
+    # f3: factor for x, y, z
+    # f4: factor for z, w
+
+    trace = simulate(foo, ())
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+
+    # test nodes
+    @test fg.num_factors == 4
+    @test length(fg.var_nodes) == 4
+    for addr in [:x, :y, :z, :w]
+        test_node(fg, addr)
+    end
+
+    # test factors
+    all_factors = Set{FactorNode}()
+    for node in values(fg.var_nodes)
+        union!(all_factors, factor_nodes(node))
+    end
+    @test length(all_factors) == 4
+    test_factor_f1(fg, all_factors)
+    test_factor_f2(fg, all_factors)
+    test_factor_f3(fg, all_factors)
+    test_factor_f4(fg, all_factors)
+
+end
+
+@testset "variable elimination" begin
+
+    trace = simulate(foo, ())
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+
+    # removes factor f4, replaces it with factor f5
+    fg = eliminate(fg, :w)
+
+    # test nodes
+    @test fg.num_factors == 5 # (note -- this is the index of the maximum factor)
+    @test length(fg.var_nodes) == 3
+    for addr in [:x, :y, :z]
+        test_node(fg, addr)
+    end
+
+    # test factors
+    all_factors = Set{FactorNode}()
+    for node in values(fg.var_nodes)
+        union!(all_factors, factor_nodes(node))
+    end
+    @test length(all_factors) == 4
+    test_factor_f1(fg, all_factors)
+    test_factor_f2(fg, all_factors)
+    test_factor_f3(fg, all_factors)
+    test_factor_f5(fg, all_factors)
+
+    # removes factor f1, f2, and f3, replaces with factor f6 (over y and z)
+    fg = eliminate(fg, :x)
+
+    # test nodes
+    @test fg.num_factors == 6 # (note -- this is the index of the maximum factor)
+    @test length(fg.var_nodes) == 2
+    for addr in [:y, :z]
+        test_node(fg, addr)
+    end
+
+    # test factors
+    all_factors = Set{FactorNode}()
+    for node in values(fg.var_nodes)
+        union!(all_factors, factor_nodes(node))
+    end
+    @test length(all_factors) == 2
+    test_factor_f5(fg, all_factors)
+    test_factor_f6(fg, all_factors)
+end
+
+@testset "conditional_dist" begin
+
+    trace = simulate(foo, ())
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+
+    # removes factor f4, replaces it with factor f5
+    fg = eliminate(fg, :w)
+    # removes factors f1, f2, f3, replace them with factor f6
+    fg = eliminate(fg, :x)
+
+    #       x=true              x=false
+    F6 = [  (0.6 * 0.2 * 0.4) + (0.4 * 0.9 * 0.9), # y=true, z=true,
+            (0.6 * 0.2 * 0.6) + (0.4 * 0.9 * 0.1),# y=true, z=false,
+            (0.6 * 0.8 * 0.9) + (0.4 * 0.1 * 0.9),# y=false, z=true,
+            (0.6 * 0.8 * 0.1) + (0.4 * 0.1 * 0.1)# y=false, z=false
+    ]
+
+    #     z=true     z=false
+    F5 = [0.4 + 0.6, 0.5 + 0.5]
+
+    # distribution on z given y
+    values = Vector{Any}(undef, 4)
+    values[addr_to_idx(fg, :y)] = true
+    actual = conditional_dist(fg, values, :z)
+    expected = normed([F6[1] * F5[1], F6[2] * F5[2]])
+    @test isapprox(actual, expected)
+    values[addr_to_idx(fg, :y)] = false
+    actual = conditional_dist(fg, values, :z)
+    expected = normed([F6[3] * F5[1], F6[4] * F5[2]])
+    @test isapprox(actual, expected)
+end
+
+@testset "MH always accepts" begin
+
+    @gen function bar()
+        x ~ bernoulli(0.6)
+        y ~ bernoulli(x ? 0.2 : 0.9)
+        z ~ bernoulli((x && y) ? 0.4 : 0.9)
+        w ~ bernoulli(z ? 0.4 : 0.5)
+        obs ~ bernoulli((x && w) ? 0.4 : 0.1)
+    end
+
+    trace = simulate(foo, ())
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    observations[:obs] = Observation([:x, :w])
+
+    elimination_order = [:w, :x, :z, :y]
+    
+    trace = simulate(foo, ())
+
+    for i in 1:100
+        trace, accepted = mh(trace, compile_and_sample_factor_graph, (latents, observations, elimination_order))
+        @test accepted
+    end
+
+end

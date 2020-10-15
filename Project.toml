@@ -6,4 +6,9 @@ version = "0.1.0"
 [deps]
 FunctionalCollections = "de31a74c-ac4f-5751-b3fd-e18cd04993ca"
 Gen = "ea4f424c-a589-11e8-07c0-fd5c91b9da4a"
-PyCall = "438e738f-606a-5dbb-bf0a-cddfbfd45ab0"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
