@@ -167,25 +167,25 @@ function conditional_dist(fg::FactorGraph{N}, values::Vector{Any}, addr::Any) wh
     var_idx = addr_to_idx(fg, addr)
     var_node = idx_to_var_node(fg, var_idx)
     n = num_values(var_node)
-    println("conditional_dist, addr: $addr, var_idx: $var_idx, num_values: $n")
+    #println("conditional_dist, addr: $addr, var_idx: $var_idx, num_values: $n")
     probs = ones(n)
     # TODO : writing the slow version first..
     # LATER: use generated function to generate a version that is specialized to N (unroll this loop, and inline the indices..)
     indices = Vector{Int}(undef, N)
     for i in 1:n
         for factor_node in factor_nodes(var_node)
-            println("i: $i, factor_node.id: $(factor_node.id)")
+            #println("i: $i, factor_node.id: $(factor_node.id)")
             F::Array{Float64,N} = factor(factor_node)
             fill!(indices, 1)
             for other_var_idx in vars(factor_node)
-                println("other_var_idx: $other_var_idx")
+                #println("other_var_idx: $other_var_idx")
                 if other_var_idx != var_idx
                     other_var_node = idx_to_var_node(fg, other_var_idx)
                     indices[other_var_idx] = value_to_idx(other_var_node, values[other_var_idx])
                 end
             end
             indices[var_idx] = i
-            println(indices)
+            #println(indices)
             probs[i] = probs[i] * F[CartesianIndex{N}(indices...)]
         end
     end
@@ -670,29 +670,36 @@ end
 
 test_conditional_dist()
 
+function test_mh_accepted()
+
+    info = Dict{Any,AddrInfo}()
+    info[:x] = AddrInfo([true, false], [])
+    info[:y] = AddrInfo([true, false], [:x])
+    info[:z] = AddrInfo([true, false], [:x, :y])
+    info[:w] = AddrInfo([true, false], [:z])
+    # TODO we also need the factors for downstream data that couple them
+    # but these aren't associated with a single random choice (and the domain of
+    # that choice wouldn't matter, even if they were)
+    elimination_order = [:w, :x, :z, :y]
+    
+    trace = simulate(foo, ())
+
+    for i in 1:100
+        println("test: $i")
+        # test generative function wrapper
+        trace, accepted = mh(trace, compile_and_sample_factor_graph, (info, elimination_order))
+        display(get_choices(trace))
+        @assert accepted
+    end
+
+end
+
+test_mh_accepted()
 
 ###########
 # example #
 ###########
 
-@gen function foo()
-    x ~ bernoulli(0.6)
-    y ~ bernoulli(x ? 0.1 : 0.9)
-    z ~ bernoulli((x && y) ? 0.4 : 0.9)
-    w ~ bernoulli(z ? 0.4 : 0.5)
-end
-
-info = Dict{Any,AddrInfo}()
-info[:x] = AddrInfo([true, false], [])
-info[:y] = AddrInfo([true, false], [:x])
-info[:z] = AddrInfo([true, false], [:x, :y])
-info[:w] = AddrInfo([true, false], [:z])
-# TODO we also need the factors for downstream data that couple them
-# but these aren't associated with a single random choice (and the domain of
-# that choice wouldn't matter, even if they were)
-elimination_order = [:w, :x, :z, :y]
-
-trace = simulate(foo, ())
 
 # test lower level code
 #fg = compile_trace_to_factor_graph(trace, info) 
@@ -713,8 +720,5 @@ trace = simulate(foo, ())
 #println(v)
 #println(log_prob)
 
-# test generative function wrapper
-trace, accepted = mh(trace, compile_and_sample_factor_graph, (info, elimination_order))
-@assert accepted
 
 end # module
