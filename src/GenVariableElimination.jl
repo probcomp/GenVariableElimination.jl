@@ -704,6 +704,14 @@ test_conditional_dist()
 
 function test_mh_accepted()
 
+    @gen function bar()
+        x ~ bernoulli(0.6)
+        y ~ bernoulli(x ? 0.2 : 0.9)
+        z ~ bernoulli((x && y) ? 0.4 : 0.9)
+        w ~ bernoulli(z ? 0.4 : 0.5)
+        obs ~ bernoulli((x && w) ? 0.4 : 0.1)
+    end
+
     trace = simulate(foo, ())
     latents = Dict{Any,Latent}()
     latents[:x] = Latent([true, false], [])
@@ -711,6 +719,7 @@ function test_mh_accepted()
     latents[:z] = Latent([true, false], [:x, :y])
     latents[:w] = Latent([true, false], [:z])
     observations = Dict{Any,Observation}()
+    observations[:obs] = Observation([:x, :w])
     #fg = compile_trace_to_factor_graph(trace, latents, observations)
 
     # TODO we also need the factors for downstream data that couple them
