@@ -264,10 +264,16 @@ end
 # compiling a trace into a factor graph #
 #########################################
 
-struct AddrInfo{T,U}
+struct Latent{T,U}
     domain::Vector{T}
     parent_addrs::Vector{U}
 end
+
+struct Observation{U}
+    parent_addrs::Vector{U} # only include addrs that are selected
+end
+
+parent_addrs(info::Union{Latent,Observation}) = info.parent_addrs
 
 function get_domain_to_idx(domain::Vector{T}) where {T}
     domain_to_idx = Dict{T,Int}()
@@ -290,87 +296,110 @@ function cartesian_product(value_lists)
     return tuples
 end
 
-function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
+# addr could be latent or obserrved...
+# latent_addrs is the set of latent variables that are involved, which may or
+# may not include the actual addr itself..
+
+function create_factor(
+        trace, addr, 
+        latents::Dict{Any,Latent}, observations::Dict{Any,Observation},
+        all_latent_addrs::Vector{Any})
+    N = length(all_latent_addrs)
+    println("creating factor node for addr: $addr")
+    in_factor = Vector{Bool}(undef, N)
+    if haskey(latents, addr)
+        for (i, a) in enumerate(all_latent_addrs)
+            in_factor[i] = (a == addr || a in parent_addrs(latents[addr]))
+        end
+        num_vars = length(parent_addrs(latents[addr]))+1
+    elseif haskey(observations, addr)
+        for (i, a) in enumerate(all_latent_addrs)
+            in_factor[i] = (a in parent_addrs(observations[addr]))
+        end
+        num_vars = length(parent_addrs(observations[addr]))
+    end
+    dims = map(i -> in_factor[i] ? length(latents[all_latent_addrs[i]].domain) : 1, 1:N)
+    log_factor = Array{Float64,N}(undef, dims...)
+    view_inds = map(i -> in_factor[i] ? Colon() : 1, 1:N)
+    log_factor_view = view(log_factor, view_inds...)
+    var_addrs = Vector{Any}(undef, num_vars)
+    value_idx_lists = Vector{Any}(undef, num_vars)
+    j = 1
+    for i in 1:N
+        if in_factor[i]
+            a = all_latent_addrs[i]
+            var_addrs[j] = a
+            value_idx_lists[j] = collect(1:length(latents[a].domain))
+            j += 1
+        end
+    end
+    @assert j == num_vars + 1
+
+    # populate factor with values by probing trace with update
+    # the key idea is that this scales exponentially in maximum number of
+    # parents of a variable, not the total number of variables
+
+    for value_idx_tuple in cartesian_product(value_idx_lists)
+        choices = choicemap()
+        for (a, value_idx) in zip(var_addrs, value_idx_tuple)
+            choices[a] = latents[a].domain[value_idx]
+        end
+        (tmp_trace, _, _, _) = update(trace, get_args(trace), map((_)->NoChange(),get_args(trace)), choices)
+        # NOTE: semantics of project not exactly aligned -- since project can use any proposal...
+        weight = project(tmp_trace, select(addr))
+        log_factor_view[value_idx_tuple...] = weight
+    end
+
+    factor = exp.(log_factor .- logsumexp(log_factor[:])) # TODO shift the rest of the code to work in log space
+
+    return (factor, var_addrs)
+end
+
+function compile_trace_to_factor_graph(
+        trace, latents::Dict{Any,Latent}, observations::Dict{Any,Observation})
 
     # choose order of addresses (note, this is NOT the elimination order)
-    # TODO does the order in which the addresses are indexed matter?
-    # (it might, somehow relate to elimination ordering?)
-    # for now, just choose an arbitrary order?
-    addrs = collect(keys(info))
-    addr_to_idx = Dict{Any,Int}()
-    for (idx, addr) in enumerate(addrs)
-        addr_to_idx[addr] = idx
+    # TODO does the order in which the addresses are indexed matter for e.g. cache performance? maybe?
+    all_latent_addrs = collect(keys(latents))
+    latent_addr_to_idx = Dict{Any,Int}()
+    for (idx, addr) in enumerate(all_latent_addrs)
+        latent_addr_to_idx[addr] = idx
     end
 
-    # construct factor nodes
-    N = length(addrs)
-    idx_to_factor_node = Vector{FactorNode{N}}(undef, N)
+    # construct factor nodes, one for each latent and downstream variable
+    N = length(all_latent_addrs)
+    addr_to_factor_node = Dict{Any,FactorNode{N}}()
     factor_id = 1
-    for (addr, addr_info) in info
-
-
-        # iterate over our values, and values of our parents, and populate the factor
-
-        in_factor(a) = (a == addr || a in addr_info.parent_addrs)
-        dims = (in_factor(a) ? length(info[a].domain) : 1 for a in addrs)
-        log_factor = Array{Float64,N}(undef, dims...)
-
-        view_inds = (in_factor(a) ? Colon() : 1 for a in addrs)
-        log_factor_view = view(log_factor, view_inds...)
-        
-        var_addrs = Vector{Any}(undef, length(addr_info.parent_addrs)+1)
-        value_idx_lists = Vector{Any}(undef, length(addr_info.parent_addrs)+1)
-        i = 1
-        for a in addrs
-            if in_factor(a)
-                var_addrs[i] = a
-                value_idx_lists[i] = collect(1:length(info[a].domain))
-                i += 1
-            end
-        end
-        @assert i == length(addr_info.parent_addrs)+2
-
-        # populate factor with values by probing trace with update
-        # the key idea is that this scales exponentially in maximum number of
-        # parents of a variable, not the total number of variables
-
-        for value_idx_tuple in cartesian_product(value_idx_lists)
-            choices = choicemap()
-            for (a, value_idx) in zip(var_addrs, value_idx_tuple)
-                choices[a] = info[a].domain[value_idx]
-            end
-            (tmp_trace, _, _, _) = update(trace, get_args(trace), map((_)->NoChange(),get_args(trace)), choices)
-            # NOTE: semantics of project not exactly aligned -- since project can use any proposal...
-            weight = project(tmp_trace, select(addr))
-            log_factor_view[value_idx_tuple...] = weight
-        end
-
-        factor = exp.(log_factor .- logsumexp(log_factor[:])) # TODO shift the rest of the code to work in log space
-        factor_node = FactorNode(factor_id, Int[addr_to_idx[a] for a in var_addrs], factor)
+    for addr in Iterators.flatten((keys(latents), keys(observations)))
+        (factor, var_addrs) = create_factor(
+            trace, addr, latents, observations, all_latent_addrs)
+        addr_to_factor_node[addr] = FactorNode{N}(factor_id, Int[latent_addr_to_idx[a] for a in var_addrs], factor)
         factor_id += 1
-        idx_to_factor_node[addr_to_idx[addr]] = factor_node
     end
+    num_factors = factor_id - 1
 
-    # compute children and self
-    children_and_self = [Set{Int}(i) for i in 1:N]
-    for (addr, addr_info) in info
-        for parent_addr in addr_info.parent_addrs
-            push!(children_and_self[addr_to_idx[parent_addr]], addr_to_idx[addr])
+    # for each latent address, the set of addresses for factors that it is involved in
+    children_and_self = [Set{Any}([all_latent_addrs[i]]) for i in 1:N]
+    for (addr, addr_info) in Iterators.flatten((latents, observations))
+        for parent_addr in parent_addrs(addr_info)
+            push!(children_and_self[latent_addr_to_idx[parent_addr]], addr)
         end
     end
 
     # construct factor graph
     var_nodes = PersistentHashMap{Int,VarNode}()
-    for (addr, addr_info) in info
+    for (addr, addr_info) in latents
+        i = latent_addr_to_idx[addr]
+        println(children_and_self[i])
         factor_nodes = PersistentSet{FactorNode{N}}(
-            [idx_to_factor_node[idx] for idx in children_and_self[addr_to_idx[addr]]])
+            [addr_to_factor_node[addr] for addr in children_and_self[i]])
         var_node = VarNode(addr, factor_nodes, addr_info.domain, get_domain_to_idx(addr_info.domain))
-        var_nodes = assoc(var_nodes, addr_to_idx[addr], var_node)
+        var_nodes = assoc(var_nodes, latent_addr_to_idx[addr], var_node)
     end
-    return FactorGraph{N}(length(idx_to_factor_node), var_nodes, addr_to_idx)
+    return FactorGraph{N}(num_factors, var_nodes, latent_addr_to_idx)
 end
 
-export AddrInfo, compile_trace_to_factor_graph
+export Latent, compile_trace_to_factor_graph
 
 ###############################
 # generative function wrapper #
@@ -378,7 +407,7 @@ export AddrInfo, compile_trace_to_factor_graph
 
 struct FactorGraphSamplerTrace <: Gen.Trace
     fg::FactorGraph
-    args::Tuple{Gen.Trace,Dict{Any,AddrInfo},Any}
+    args::Tuple{Gen.Trace,Dict{Any,Latent},Dict{Any,Observation},Any}
     choices::Gen.DynamicChoiceMap
     log_prob::Float64
 end
@@ -389,8 +418,8 @@ end
 const compile_and_sample_factor_graph = FactorGraphSampler()
 
 function Gen.simulate(gen_fn::FactorGraphSampler, args::Tuple)
-    (model_trace, info, elimination_order) = args
-    fg = compile_trace_to_factor_graph(model_trace, info)
+    (model_trace, latents, observations, elimination_order) = args
+    fg = compile_trace_to_factor_graph(model_trace, latents, observations)
     (values, log_prob) = sample_and_compute_log_prob(fg, elimination_order)
     choices = choicemap()
     for (addr, value) in values
@@ -400,10 +429,10 @@ function Gen.simulate(gen_fn::FactorGraphSampler, args::Tuple)
 end
 
 function Gen.generate(gen_fn::FactorGraphSampler, args::Tuple, choices::ChoiceMap)
-    (model_trace, info, elimination_order) = args
-    fg = compile_trace_to_factor_graph(model_trace, info)
+    (model_trace, latents, observations, elimination_order) = args
+    fg = compile_trace_to_factor_graph(model_trace, latents, observations)
     values = Dict{Any,Any}()
-    for addr in keys(info)
+    for addr in keys(latents)
         values[addr] = choices[addr]
     end
     log_prob = compute_log_prob(fg, elimination_order, values)
@@ -546,12 +575,13 @@ function test_compile_factor_graph()
     # f4: factor for z, w
 
     trace = simulate(foo, ())
-    info = Dict{Any,AddrInfo}()
-    info[:x] = AddrInfo([true, false], [])
-    info[:y] = AddrInfo([true, false], [:x])
-    info[:z] = AddrInfo([true, false], [:x, :y])
-    info[:w] = AddrInfo([true, false], [:z])
-    fg = compile_trace_to_factor_graph(trace, info)
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
 
     # test nodes
     @assert fg.num_factors == 4
@@ -577,12 +607,13 @@ test_compile_factor_graph()
 function test_eliminate()
 
     trace = simulate(foo, ())
-    info = Dict{Any,AddrInfo}()
-    info[:x] = AddrInfo([true, false], [])
-    info[:y] = AddrInfo([true, false], [:x])
-    info[:z] = AddrInfo([true, false], [:x, :y])
-    info[:w] = AddrInfo([true, false], [:z])
-    fg = compile_trace_to_factor_graph(trace, info)
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
 
     # removes factor f4, replaces it with factor f5
     fg = eliminate(fg, :w)
@@ -630,12 +661,13 @@ test_eliminate()
 function test_conditional_dist()
 
     trace = simulate(foo, ())
-    info = Dict{Any,AddrInfo}()
-    info[:x] = AddrInfo([true, false], [])
-    info[:y] = AddrInfo([true, false], [:x])
-    info[:z] = AddrInfo([true, false], [:x, :y])
-    info[:w] = AddrInfo([true, false], [:z])
-    fg = compile_trace_to_factor_graph(trace, info)
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
 
     # removes factor f4, replaces it with factor f5
     fg = eliminate(fg, :w)
@@ -672,11 +704,15 @@ test_conditional_dist()
 
 function test_mh_accepted()
 
-    info = Dict{Any,AddrInfo}()
-    info[:x] = AddrInfo([true, false], [])
-    info[:y] = AddrInfo([true, false], [:x])
-    info[:z] = AddrInfo([true, false], [:x, :y])
-    info[:w] = AddrInfo([true, false], [:z])
+    trace = simulate(foo, ())
+    latents = Dict{Any,Latent}()
+    latents[:x] = Latent([true, false], [])
+    latents[:y] = Latent([true, false], [:x])
+    latents[:z] = Latent([true, false], [:x, :y])
+    latents[:w] = Latent([true, false], [:z])
+    observations = Dict{Any,Observation}()
+    #fg = compile_trace_to_factor_graph(trace, latents, observations)
+
     # TODO we also need the factors for downstream data that couple them
     # but these aren't associated with a single random choice (and the domain of
     # that choice wouldn't matter, even if they were)
@@ -687,7 +723,7 @@ function test_mh_accepted()
     for i in 1:100
         println("test: $i")
         # test generative function wrapper
-        trace, accepted = mh(trace, compile_and_sample_factor_graph, (info, elimination_order))
+        trace, accepted = mh(trace, compile_and_sample_factor_graph, (latents, observations, elimination_order))
         display(get_choices(trace))
         @assert accepted
     end
