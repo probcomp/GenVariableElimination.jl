@@ -130,26 +130,24 @@ function conditional_dist(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr:
         @assert factor_node in fg.factor_nodes # TODO not needed?
         f = factor(factor_node)
         for idx in 1:n
-            CartesianIndex{N}(
-            f[,idx]
         end
     end
 end
 
-function simulate_and_logpdf_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any)
+function sample_and_compute_log_prob_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any)
     dist = conditional_dist(fg, other_values, addr)
     idx = categorical(dist)
     value = idx_to_value(fg.var_nodes[addr], idx)
     return (value, log(dist[idx]))
 end
 
-function logpdf_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any, value:Any)
+function compute_log_prob_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any, value:Any)
     dist = conditional_dist(fg, other_values, addr)
     idx = value_to_idx(fg.var_nodes[addr], value)
     return log(dist[idx])
 end
 
-function sample_and_log_prob(fg::FactorGraph{N}, elimination_order) where {N}
+function sample_and_compute_log_prob(fg::FactorGraph{N}, elimination_order) where {N}
     addr_to_fg = Dict{Any,FactorGraph{N}}()
     for addr in elimination_order
         addr_to_fg[addr] = fg
@@ -159,13 +157,13 @@ function sample_and_log_prob(fg::FactorGraph{N}, elimination_order) where {N}
     total_log_prob = 0.0
     for addr in reverse(elimination_order)
         fg = addr_to_fg[addr]
-        (values[addr], log_prob) = simulate_and_logpdf_addr(fg, values, addr)
+        (values[addr], log_prob) = sample_and_compute_log_prob_addr(fg, values, addr)
         total_log_prob += log_prob
     end
     return (values, total_log_prob)
 end
 
-function log_prob(fg::FactorGraph{N}, values::Dict{Any,Any}, elimination_order)
+function compute_log_prob(fg::FactorGraph{N}, elimination_order, values::Dict{Any,Any})
     addr_to_fg = Dict{Any,FactorGraph{N}}()
     for addr in elimination_order
         addr_to_fg[addr] = fg
@@ -175,24 +173,11 @@ function log_prob(fg::FactorGraph{N}, values::Dict{Any,Any}, elimination_order)
     total_log_prob = 0.0
     for addr in reverse(elimination_order)
         fg = addr_to_fg[addr]
-        log_prob = logpdf_addr(fg, values, addr, values[addr])
+        log_prob = compute_log_prob_addr(fg, values, addr, values[addr])
         total_log_prob += log_prob
     end
     return total_log_prob
 end
-
-# a factor graph contains:
-# - a map from address to variable node
-# - a set of factor nodes, which may be initially present or constructed during VE
-
-# methods on factor graphs:
-# - log joint probability of a complete assignment to all variables in the FG (used, at minimum, during sampling)
-
-# needed:
-# > get a list of all factors that mention a variable
-# > generate the product factor
-# > sum out a product factor
-# > remove factors and add the new summed out factor
 
 # sampling and joint probability given variable elimination sequence - 
 # in reverse elimination order:
@@ -247,6 +232,54 @@ function to_factor_graph(trace, info::Dict{Any,AddrInfo})
     return FactorGraph(collect(factor_nodes_dict), collect(var_nodes_dict))
 end
 
+####################################
+# wrap it in a generative function #
+####################################
+
+struct FactorGraphSamplerTrace
+    fg::FactorGraph
+    args::Tuple{Gen.Trace,Dict{Any,AddrInfo},Any}
+    choices::Gen.DynamicChoiceMap
+    log_prob::Float64
+end
+
+struct FactorGraphSampler <: GenerativeFunction{Nothing,FactorGraphSamplerTrace}
+end
+
+const compile_and_sample_factor_graph = FactorGraphSampler()
+
+function Gen.simulate(gen_fn::FactorGraphSampler, args::Tuple)
+    (model_trace, info, elimination_order) = args
+    fg = compile_factor_graph(model_trace, info)
+    (values, log_prob) = sample_and_compute_log_prob(fg, elimination_order)
+    choices = choicemap()
+    for (addr, value) in values
+        choices[addr] = value
+    end
+    return FactorGraphSamplerTrace(fg, args, choices, log_prob)
+end
+
+function Gen.generate(gen_fn::FactorGraphSampler, args::Tuple, choices::ChoiceMap)
+    (model_trace, info, elimination_order) = args
+    fg = compile_factor_graph(model_trace, info)
+    values = Dict{Any,Any}()
+    for addr in keys(info)
+        values[addr] = choices[addr]
+    end
+    log_prob = compute_log_prob(fg, elimination_order, values)
+    trace = FactorGraphSamplerTrace(fg, args, choices, log_prob)
+    return (trace, log_prob)
+end
+
+Gen.get_args(trace::FactorGraphSampler) = trace.args
+Gen.get_retval(trace::FactorGraphSampler) = nothing
+Gen.get_choices(trace::FactorGraphSampler) = trace.values
+Gen.get_score(trace::FactorGraphSampler) = trace.log_prob
+Gen.get_gen_fn(trace::FactorGraphSampler) = compile_and_sample_factor_graph
+Gen.project(trace::FactorGraphSampler, ::EmptyChoiceMap) = 0.0
+Gen.has_argument_grads(gen_fn::FactorGraphSampler) = (false, false, false)
+Gen.accepts_output_grad(gen_fn::FactorGraphSampler) = false
+
 ###############################################
 # step 1: compile a trace into a factor graph #
 ###############################################
@@ -268,58 +301,4 @@ trace = simulate(foo, ())
 
 fg = to_factor_graph(trace, info)
 
-########################################################
-# step 2: run variable elimination in the factor graph #
-########################################################
-
-# each time you eliminate a variable X, you:
-# - create a new factor that contains X and all of the variables with which it appears in factors
-# - then we eliminate X, by replacing it with a new factor that contians all of these variables except for X
-# - 
-
-# elimination is a sequence of factor graphs...
-# use FunctionalCollections?
-eliminate!(factor_graph, :w)
-eliminate!(factor_graph, :z)
-eliminate!(factor_graph, :x)
-
-# you end up with ... 
-
-
-##############################################
-# step 3: sample from the joint distribution #
-##############################################
-
-# variables get sampled in the reverse order from which they were eliminated
-# we use the intermediate factor graph right before they are eliminated to
-# compute the distribution
-
-# (we just enumerate over the value of the variable to be sampled, and compute
-# the total potential of the factor graph, for each value --- where all other
-# variables in the FG have their values instantiated)
-
-function joint_sample(factor_graph, elimination)
-
-    # TODO
-    # return the joint sample, and the log joint probability
-end
-
-function joint_evaluate(factor_graph, elimination, values)
-
-    # TODO
-    # return the log joint probability
-end
-
-
-############################################
-# step 4: wrap it in a generative function #
-############################################
-
-# it's okay if the only operations supported by the generative function are
-# simulate(), and generate() given all values
-
-# idea: the bayesian network could actually not match exactly
-# and also the enumeration grid could actually not match exactly either
-# and the move will still be valid, since it is within MH
-# (and -- we can check that it's valid by asserting that it accepts)
 end # module
