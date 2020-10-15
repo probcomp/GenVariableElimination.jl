@@ -58,7 +58,7 @@ struct FactorGraph{N}
     num_factors::Int
     var_nodes::PersistentHashMap{Int,VarNode}
 
-    # NOTE: when variables get eliminated from a factor graph, they don't get reindexed
+    # NOTE: when variables get eliminated from a factor graph, they don't get reindex]
     # (i.e. these fields are unchanged)
     addr_to_idx::Dict{Any,Int} 
 end
@@ -161,7 +161,6 @@ function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
 end
 
 function conditional_dist(fg::FactorGraph{N}, values::Vector{Any}, addr::Any) where {N}
-    println("conditional dist, addr: $addr")
 
     # other_values must contain a value for all variables that have a factor in
     # common with variable addr in fg
@@ -189,7 +188,6 @@ function conditional_dist(fg::FactorGraph{N}, values::Vector{Any}, addr::Any) wh
 end
 
 function sample_and_compute_log_prob_addr(fg::FactorGraph, values::Vector{Any}, addr::Any)
-    println("sample and compute log prob addr: $addr")
     dist = conditional_dist(fg, values, addr)
     idx = categorical(dist)
     value = idx_to_value(idx_to_var_node(fg, addr_to_idx(fg, addr)), idx)
@@ -197,7 +195,6 @@ function sample_and_compute_log_prob_addr(fg::FactorGraph, values::Vector{Any}, 
 end
 
 function compute_log_prob_addr(fg::FactorGraph, values::Vector{Any}, addr::Any, value::Any)
-    println("compute log prob addr: $addr")
     dist = conditional_dist(fg, values, addr)
     idx = value_to_idx(idx_to_var_node(fg, addr_to_idx(fg, addr)), value)
     return log(dist[idx])
@@ -300,21 +297,17 @@ function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
         addr_to_idx[addr] = idx
     end
 
-    println("addrs: $addrs")
-
     # construct factor nodes
     N = length(addrs)
     idx_to_factor_node = Vector{FactorNode{N}}(undef, N)
     factor_id = 1
     for (addr, addr_info) in info
 
-        println("constructing factor for addr $addr and its parents:")
 
         # iterate over our values, and values of our parents, and populate the factor
 
         in_factor(a) = (a == addr || a in addr_info.parent_addrs)
         dims = (in_factor(a) ? length(info[a].domain) : 1 for a in addrs)
-        println("dims: $dims")
         log_factor = Array{Float64,N}(undef, dims...)
 
         view_inds = (in_factor(a) ? Colon() : 1 for a in addrs)
@@ -337,12 +330,10 @@ function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
         # parents of a variable, not the total number of variables
 
         for value_idx_tuple in cartesian_product(value_idx_lists)
-            println("value_idx_tuple: $value_idx_tuple")
             choices = choicemap()
             for (a, value_idx) in zip(var_addrs, value_idx_tuple)
                 choices[a] = info[a].domain[value_idx]
             end
-            display(choices)
             (tmp_trace, _, _, _) = update(trace, get_args(trace), map((_)->NoChange(),get_args(trace)), choices)
             # NOTE: semantics of project not exactly aligned -- since project can use any proposal...
             weight = project(tmp_trace, select(addr))
@@ -350,7 +341,6 @@ function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
         end
 
         factor = exp.(log_factor .- logsumexp(log_factor[:])) # TODO shift the rest of the code to work in log space
-        println("factor: factor")
         factor_node = FactorNode(factor_id, Int[addr_to_idx[a] for a in var_addrs], factor)
         factor_id += 1
         idx_to_factor_node[addr_to_idx[addr]] = factor_node
@@ -431,14 +421,114 @@ export compile_and_sample_factor_graph
 # tests #
 #########
 
-function test_compile_factor_graph()
+@gen function foo()
+    x ~ bernoulli(0.6)
+    y ~ bernoulli(x ? 0.2 : 0.9)
+    z ~ bernoulli((x && y) ? 0.4 : 0.9)
+    w ~ bernoulli(z ? 0.4 : 0.5)
+end
 
-    @gen function foo()
-        x ~ bernoulli(0.6)
-        y ~ bernoulli(x ? 0.2 : 0.9)
-        z ~ bernoulli((x && y) ? 0.4 : 0.9)
-        w ~ bernoulli(z ? 0.4 : 0.5)
-    end
+function test_node(fg, addr)
+    node = idx_to_var_node(fg, addr_to_idx(fg, addr))
+    @assert node.addr == addr
+    @assert num_values(node) == 2
+    @assert idx_to_value(node, 1) == true
+    @assert idx_to_value(node, 2) == false
+    @assert value_to_idx(node, true) == 1
+    @assert value_to_idx(node, false) == 2
+end
+
+normed(arr) = arr / sum(arr)
+
+function test_factor_f1(fg, all_factors)
+    f1 = first(filter((fn) -> (
+        length(vars(fn)) == 1 &&
+        addr_to_idx(fg, :x) in vars(fn)), all_factors))
+    
+    f1_xtrue = factor_value(fg, f1, Dict(addr_to_idx(fg, :x) => true))
+    f1_xfalse = factor_value(fg, f1, Dict(addr_to_idx(fg, :x) => false))
+    F = [f1_xtrue, f1_xfalse]
+    @assert isapprox(normed(F), normed([0.6, 0.4]))
+end
+
+function test_factor_f2(fg, all_factors)
+    f2 = first(filter((fn) -> (
+        length(vars(fn)) == 2 &&
+        addr_to_idx(fg, :x) in vars(fn) &&
+        addr_to_idx(fg, :y) in vars(fn)), all_factors))
+    f2_xtrue_ytrue = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true))
+    f2_xtrue_yfalse = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false))
+    f2_xfalse_ytrue = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true))
+    f2_xfalse_yfalse = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false))
+    F = [f2_xtrue_ytrue, f2_xtrue_yfalse, f2_xfalse_ytrue, f2_xfalse_yfalse]
+    @assert isapprox(normed(F), normed([0.2, 0.8, 0.9, 0.1]))
+end
+
+function test_factor_f3(fg, all_factors)
+    f3 = first(filter((fn) -> (
+        length(vars(fn)) == 3 &&
+        addr_to_idx(fg, :x) in vars(fn) &&
+        addr_to_idx(fg, :y) in vars(fn) &&
+        addr_to_idx(fg, :z) in vars(fn)), all_factors))
+    f3_true_true_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
+    f3_true_false_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
+    f3_false_true_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
+    f3_false_false_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
+    f3_true_true_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
+    f3_true_false_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
+    f3_false_true_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
+    f3_false_false_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
+    F = [f3_true_true_true, f3_true_false_true, f3_false_true_true, f3_false_false_true, f3_true_true_false, f3_true_false_false, f3_false_true_false, f3_false_false_false]
+    @assert isapprox(normed(F), normed([
+        0.4, 0.9, 0.9, 0.9,# z true
+        0.6, 0.1, 0.1, 0.1# z false
+    ]))
+end
+
+function test_factor_f4(fg, all_factors)
+    f4 = first(filter((fn) -> (
+        length(vars(fn)) == 2 &&
+        addr_to_idx(fg, :z) in vars(fn) &&
+        addr_to_idx(fg, :w) in vars(fn)), all_factors))
+    f4_xtrue_ytrue = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => true, addr_to_idx(fg, :w) => true))
+    f4_xtrue_yfalse = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => true, addr_to_idx(fg, :w) => false))
+    f4_xfalse_ytrue = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => false, addr_to_idx(fg, :w) => true))
+    f4_xfalse_yfalse = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => false, addr_to_idx(fg, :w) => false))
+    F = [f4_xtrue_ytrue, f4_xtrue_yfalse, f4_xfalse_ytrue, f4_xfalse_yfalse]
+    @assert isapprox(normed(F), normed([0.4, 0.6, 0.5, 0.5]))
+end
+
+function test_factor_f5(fg, all_factors)
+    f = first(filter((fn) -> (
+        length(vars(fn)) == 1 &&
+        addr_to_idx(fg, :z) in vars(fn)), all_factors))
+    f_true = factor_value(fg, f, Dict(addr_to_idx(fg, :z) => true))
+    f_false = factor_value(fg, f, Dict(addr_to_idx(fg, :z) => false))
+    F = [f_true, f_false]
+    @assert isapprox(normed(F), normed([0.4 + 0.6, 0.5 + 0.5]))
+end
+
+function test_factor_f6(fg, all_factors)
+    println("testing factor f6")
+    f = first(filter((fn) -> (
+        length(vars(fn)) == 2 &&
+        addr_to_idx(fg, :y) in vars(fn) &&
+        addr_to_idx(fg, :z) in vars(fn)), all_factors))
+    f_true_true = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
+    f_true_false = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
+    f_false_true = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
+    f_false_false = factor_value(fg, f, Dict(addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
+    F = [f_true_true, f_true_false, f_false_true, f_false_false]
+    @assert isapprox(normed(F), normed([
+        # x=true         # x=false
+        (0.6 * 0.2 * 0.4) + (0.4 * 0.9 * 0.9), # y=true, z=true,
+        (0.6 * 0.2 * 0.6) + (0.4 * 0.9 * 0.1),# y=true, z=false,
+        (0.6 * 0.8 * 0.9) + (0.4 * 0.1 * 0.9),# y=false, z=true,
+        (0.6 * 0.8 * 0.1) + (0.4 * 0.1 * 0.1)# y=false, z=false
+    ]))
+end
+
+function test_compile_factor_graph()
 
     # x 
     # y
@@ -458,84 +548,77 @@ function test_compile_factor_graph()
     info[:w] = AddrInfo([true, false], [:z])
     fg = compile_trace_to_factor_graph(trace, info)
 
+    # test nodes
     @assert fg.num_factors == 4
     @assert length(fg.var_nodes) == 4
-    xnode = idx_to_var_node(fg, addr_to_idx(fg, :x))
-    ynode = idx_to_var_node(fg, addr_to_idx(fg, :y))
-    znode = idx_to_var_node(fg, addr_to_idx(fg, :z))
-    wnode = idx_to_var_node(fg, addr_to_idx(fg, :w))
-    @assert addr(xnode) == :x
-    @assert addr(ynode) == :y
-    @assert addr(znode) == :z
-    @assert addr(wnode) == :w
-    for node in [xnode, ynode, znode, wnode]
-        @assert num_values(node) == 2
-        @assert idx_to_value(node, 1) == true
-        @assert idx_to_value(node, 2) == false
-        @assert value_to_idx(node, true) == 1
-        @assert value_to_idx(node, false) == 2
+    for addr in [:x, :y, :z, :w]
+        test_node(fg, addr)
     end
+
+    # test factors
     all_factors = Set{FactorNode}()
-    for node in [xnode, ynode, znode, wnode]
+    for node in values(fg.var_nodes)
         union!(all_factors, factor_nodes(node))
     end
     @assert length(all_factors) == 4
-    f1 = first(filter((fn) -> (
-        length(vars(fn)) == 1 &&
-        addr_to_idx(fg, :x) in vars(fn)), all_factors))
-    f2 = first(filter((fn) -> (
-        length(vars(fn)) == 2 &&
-        addr_to_idx(fg, :x) in vars(fn) &&
-        addr_to_idx(fg, :y) in vars(fn)), all_factors))
-    f3 = first(filter((fn) -> (
-        length(vars(fn)) == 3 &&
-        addr_to_idx(fg, :x) in vars(fn) &&
-        addr_to_idx(fg, :y) in vars(fn) &&
-        addr_to_idx(fg, :z) in vars(fn)), all_factors))
-    f4 = first(filter((fn) -> (
-        length(vars(fn)) == 2 &&
-        addr_to_idx(fg, :z) in vars(fn) &&
-        addr_to_idx(fg, :w) in vars(fn)), all_factors))
+    test_factor_f1(fg, all_factors)
+    test_factor_f2(fg, all_factors)
+    test_factor_f3(fg, all_factors)
+    test_factor_f4(fg, all_factors)
 
-    normed(arr) = arr / sum(arr)
-    
-    f1_xtrue = factor_value(fg, f1, Dict(addr_to_idx(fg, :x) => true))
-    f1_xfalse = factor_value(fg, f1, Dict(addr_to_idx(fg, :x) => false))
-    F = [f1_xtrue, f1_xfalse]
-    @assert isapprox(normed(F), normed([0.6, 0.4]))
-
-    f2_xtrue_ytrue = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true))
-    f2_xtrue_yfalse = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false))
-    f2_xfalse_ytrue = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true))
-    f2_xfalse_yfalse = factor_value(fg, f2, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false))
-    F = [f2_xtrue_ytrue, f2_xtrue_yfalse, f2_xfalse_ytrue, f2_xfalse_yfalse]
-    @assert isapprox(normed(F), normed([0.2, 0.8, 0.9, 0.1]))
-
-    f3_true_true_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
-    f3_true_false_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
-    f3_false_true_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => true))
-    f3_false_false_true = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => true))
-    f3_true_true_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
-    f3_true_false_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => true, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
-    f3_false_true_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => true, addr_to_idx(fg, :z) => false))
-    f3_false_false_false = factor_value(fg, f3, Dict(addr_to_idx(fg, :x) => false, addr_to_idx(fg, :y) => false, addr_to_idx(fg, :z) => false))
-    F = [f3_true_true_true, f3_true_false_true, f3_false_true_true, f3_false_false_true, f3_true_true_false, f3_true_false_false, f3_false_true_false, f3_false_false_false]
-    @assert isapprox(normed(F), normed([
-        0.4, 0.9, 0.9, 0.9,# z true
-        0.6, 0.1, 0.1, 0.1# z false
-    ]))
-
-    f4_xtrue_ytrue = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => true, addr_to_idx(fg, :w) => true))
-    f4_xtrue_yfalse = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => true, addr_to_idx(fg, :w) => false))
-    f4_xfalse_ytrue = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => false, addr_to_idx(fg, :w) => true))
-    f4_xfalse_yfalse = factor_value(fg, f4, Dict(addr_to_idx(fg, :z) => false, addr_to_idx(fg, :w) => false))
-    F = [f4_xtrue_ytrue, f4_xtrue_yfalse, f4_xfalse_ytrue, f4_xfalse_yfalse]
-    @assert isapprox(normed(F), normed([0.4, 0.6, 0.5, 0.5]))
-    
 end
 test_compile_factor_graph()
 
 function test_eliminate()
+
+    trace = simulate(foo, ())
+    info = Dict{Any,AddrInfo}()
+    info[:x] = AddrInfo([true, false], [])
+    info[:y] = AddrInfo([true, false], [:x])
+    info[:z] = AddrInfo([true, false], [:x, :y])
+    info[:w] = AddrInfo([true, false], [:z])
+    fg = compile_trace_to_factor_graph(trace, info)
+
+    # removes factor f4, replaces it with factor f5
+    fg = eliminate(fg, :w)
+
+    # test nodes
+    @assert fg.num_factors == 5 # (note -- this is the index of the maximum factor)
+    @assert length(fg.var_nodes) == 3
+    for addr in [:x, :y, :z]
+        test_node(fg, addr)
+    end
+
+    # test factors
+    all_factors = Set{FactorNode}()
+    for node in values(fg.var_nodes)
+        union!(all_factors, factor_nodes(node))
+    end
+    @assert length(all_factors) == 4
+    test_factor_f1(fg, all_factors)
+    test_factor_f2(fg, all_factors)
+    test_factor_f3(fg, all_factors)
+    println("test factor f5")
+    test_factor_f5(fg, all_factors)
+
+    # removes factor f1, f2, and f3, replaces with factor f6 (over y and z)
+    fg = eliminate(fg, :x)
+
+    # test nodes
+    @assert fg.num_factors == 6 # (note -- this is the index of the maximum factor)
+    @assert length(fg.var_nodes) == 2
+    for addr in [:y, :z]
+        test_node(fg, addr)
+    end
+
+    # test factors
+    all_factors = Set{FactorNode}()
+    for node in values(fg.var_nodes)
+        union!(all_factors, factor_nodes(node))
+    end
+    @assert length(all_factors) == 2
+    test_factor_f5(fg, all_factors)
+    test_factor_f6(fg, all_factors)
 end
 test_eliminate()
 
