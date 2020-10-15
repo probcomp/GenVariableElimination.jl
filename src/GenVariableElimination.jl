@@ -3,9 +3,9 @@ module GenVariableElimination
 using Gen
 using FunctionalCollections: PersistentSet, PersistentHashMap, dissoc, assoc, conj, disj
 
-################
-# factor graph #
-################
+####################################################
+# factor graph, variable elimination, and sampling #
+####################################################
 
 # TODO add graphviz visualization of the factor graph
 # TODO use logspace in probability calculations
@@ -15,7 +15,7 @@ using FunctionalCollections: PersistentSet, PersistentHashMap, dissoc, assoc, co
 struct VarNode{T,V} # T would be FactorNode, but for https://github.com/JuliaLang/julia/issues/269
     addr::Any
     factor_nodes::PersistentSet{T}
-    idx_to_domain::Vector{V} # TODO need to populate these
+    idx_to_domain::Vector{V}
     domain_to_idx::Dict{V,Int}
 end
 
@@ -37,23 +37,25 @@ function add_factor_node(node::VarNode{T,V}, factor_node::T) where {T,V}
         node.idx_to_domain, node.domain_to_idx)
 end
 
-struct FactorNode{N} # N is the number of variables in the (original?) factor graph
-    var_nodes::Vector{VarNode} # immutable
+struct FactorNode{N} # N is the number of variables in the (original) factor graph
+    vars::Vector{Int} # immutable
     factor::Array{Float64,N} # immutable
 end
 
-vars(node::FactorNode) = node.var_nodes
+vars(node::FactorNode) = node.vars
 factor(node::FactorNode) = node.factor
 
 struct FactorGraph{N}
-    var_nodes::PersistentHashMap{Any,VarNode}
+    var_nodes::PersistentHashMap{Int,VarNode}
 
     # NOTE: when variables get eliminated from a factor graph, they don't get reindexed
     # (i.e. these fields are unchanged)
     addr_to_idx::Dict{Any,Int} 
 end
 
-addr_to_var(fg::FactorGraph, addr::Any) = fg.var_nodes[addr]
+idx_to_var_node(fg::FactorGraph, idx::Int) = fg.var_nodes[idx]
+addr_to_idx(fg::FactorGraph, addr::Int) = fg.addr_to_idx[addr]
+addr_to_var_node(fg::FactorGraph, addr) = fg.var_nodes[fg.addr_to_idx[addr]]
 
 # variable elimination
 # - generates a sequence of factor graphs
@@ -74,41 +76,42 @@ function multiply_and_sum(factors::Array{Float64,N}, idx_to_sum_over::Int) where
 end
 
 function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
-    eliminated_var_node = fg.var_nodes[addr]
+    eliminated_var = addr_to_idx(fg, addr)
+    eliminated_var_node = idx_to_var_node(fg, eliminated_var)
     factors_to_combine = Vector{Array{Float64,N}}()
-    other_involved_var_nodes = Dict{Any,VarNode{FactorNode{N}}}()
+    other_involved_var_nodes = Dict{Int,VarNode{FactorNode{N}}}()
     for factor_node in factor_nodes(eliminated_var_node)
         push!(factors_to_combine, factor(factor_node))
 
         # remove the reference to this factor node from its variable nodes
-        for other_var_node::VarNode{FactorNode{N}} in vars(factor_node)
-            if !haskey(other_involved_var_nodes, addr(other_var_node))
-                other_involved_var_nodes[addr(other_var_node)] = other_var_node
+        for other_var::Int in vars(factor_node)
+            if !haskey(other_involved_var_nodes, other_var)
+                other_involved_var_nodes[other_var] = idx_to_var_node(fg, other_var)
             else
-                other_var_node = other_involved_var_nodes[addr(other_var_node)]
+                other_var_node = other_involved_var_nodes[other_var]
             end
             @assert factor_node in factors(other_var_node)
             other_var_node = remove_factor_node(other_var_node, factor_node)
-            other_involved_var_nodes[addr(other_var_node)] = other_var_node
+            other_involved_var_nodes[other_var] = other_var_node
         end
     end
 
     # compute the new factor
     # TODO use log space
-    new_factor = multiply_and_sum(factors_to_combine, fg.addr_to_idx[addr])
+    new_factor = multiply_and_sum(factors_to_combine, eliminated_var)
 
     # add the new factor node
-    new_factor_node = FactorNode{N}(var_nodes_for_new_factor, new_factor)
-    for (a, other_var_node) in var_nodes_for_new_factor
-        var_nodes_for_new_factor[a] = add_factor_node(other_var_node, new_factor_node)
+    new_factor_node = FactorNode{N}(collect(keys(other_involved_var_nodes)), new_factor)
+    for (other_var, other_var_node) in other_involved_var_nodes
+        other_involved_var_nodes[other_var] = add_factor_node(other_var_node, new_factor_node)
     end
 
     # remove the eliminated var node
-    new_var_nodes = dissoc(fg.var_nodes, eliminated_var_node)
+    new_var_nodes = dissoc(fg.var_nodes, eliminated_var)
 
     # replace old other var nodes with new other var nodes
-    for (a, other_var_node) in var_nodes_for_new_factor
-        new_var_nodes = assoc(new_var_nodes, a, other_var_node)
+    for (other_var, other_var_node) in other_involved_var_nodes
+        new_var_nodes = assoc(new_var_nodes, other_var, other_var_node)
     end
 
     return FactorGraph{N}(new_var_nodes, fg.addr_to_idx)
@@ -117,7 +120,7 @@ end
 function conditional_dist(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any)
     # other_values must contain a value for all variables that have a factor in
     # common with variable addr in fg
-    var_node = fg.var_nodes[addr]
+    var_node = addr_to_var_node(fg, addr)
     n = num_values(var_node)
     probs = ones(n)
     # TODO : writing the slow version first..
@@ -128,8 +131,8 @@ function conditional_dist(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr:
             F::Array{Float64,N} = factor(factor_node)
             fill!(indices, 1)
             for (addr, value) in other_values
-                other_var_node = addr_to_var(fg, addr)
-                indices[addr_to_var(fg, addr)] = value_to_idx(other_var_node, value)
+                other_var_node = addr_to_var_node(fg, addr)
+                indices[addr_to_var_node(fg, addr)] = value_to_idx(other_var_node, value)
             end
             probs[i] = probs[i] * F[CartesianIndex{N}(indices...)]
         end
@@ -140,13 +143,13 @@ end
 function sample_and_compute_log_prob_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any)
     dist = conditional_dist(fg, other_values, addr)
     idx = categorical(dist)
-    value = idx_to_value(fg.var_nodes[addr], idx)
+    value = idx_to_value(addr_to_var_node(fg, addr), idx)
     return (value, log(dist[idx]))
 end
 
 function compute_log_prob_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any, value:Any)
     dist = conditional_dist(fg, other_values, addr)
-    idx = value_to_idx(fg.var_nodes[addr], value)
+    idx = value_to_idx(addr_to_var_node(fg, addr), value)
     return log(dist[idx])
 end
 
@@ -204,41 +207,99 @@ struct AddrInfo{T,U}
     parent_addrs::Vector{U}
 end
 
+function get_domain_to_idx(domain::Vector{T}) where {T}
+    domain_to_idx = Dict{T,Int}()
+    for (i, value) in enumerate(domain)
+        domain_to_idx[value] = i
+    end
+    return domain_to_idx
+end
+
+# TODO: is this needed?
+function cartesian_product(value_lists)
+    tuples = Vector{Tuple}()
+    for trace in value_lists[1]
+        if length(value_lists) > 1
+            append!(tuples,
+                [(trace, rest...) for rest in cartesian_product(value_lists[2:end])])
+        else
+            append!(tuples, [(trace,)])
+        end
+    end
+    return tuples
+end
+
+
 function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
-    var_nodes_dict = Dict{Any,VarNode}()
-    factor_nodes_dict = Dict{Any,FactorNode}()
 
-    # TODO finish
-
-    for (addr, _) in info
-        var_nodes_dict[addr] = VarNode(addr, FactorNode[])
-        factor_nodes_dict[addr] = FactorNode(addr, VarNode[], nothing)
+    # choose order of addresses (note, this is NOT the elimination order)
+    # TODO does the order in which the addresses are indexed matter?
+    # (it might, somehow relate to elimination ordering?)
+    # for now, just choose an arbitrary order?
+    addrs = collect(keys(info))
+    addr_to_idx = Dict{Any,Int}()
+    for (idx, addr) in enumerate(addrs)
+        addr_to_idx[addr] = idx
     end
 
+    # construct factor nodes
+    N = length(addrs)
+    idx_to_factor_node = Vector{FactorNode{N}}(undef, N)
     for (addr, addr_info) in info
-        node = var_nodes_dict[addr]
+
+        # iterate over our values, and values of our parents, and populate the factor
+
+        dims = (if (a == addr || a in addr_info.parent_addrs) length(info[a].domain) else 1 end for a in addrs)
+        log_factor = Array{Float64,N}(undef, dims...)
+
+        view_inds = (if (a == addr || a in addr_info.parent_addrs) : else 1 end for a in addrs)
+        log_factor_view = view(log_factor, view_inds...)
+        
+        var_addrs = Vector{Any}(undef, length(addr_info.parent_addrs)+1)
+        value_idx_lists = Vector{Any}(undef, length(addr_info.parent_addrs)+1)
+        i = 1
+        for a in addrs
+            if (a == addr || a in addr_info.parent_addrs)
+                var_addrs[i] = a
+                value_idx_lists[i] = collect(1:length(info[a].domain))
+            end
+        end
+
+        # populate factor with values by probing trace with update
+        # the key idea is that this scales exponentially in maximum number of
+        # parents of a variable, not the total number of variables
+
+        for value_idx_tuple in enumerate(cartesian_product(value_idx_lists))
+            choices = choicemap()
+            for (a, value_idx) in zip(var_addrs, value_idx_tuple)
+                choices[a] = info[a].domains[value_idx]
+            end
+            (_, weight, _, _) = update(trace, get_args(trace), map((_)->NoChange(),get_args(trace)), choices)
+            log_factor_view[value_idx_tuple...] = weight
+        end
+
+        factor = exp.(log_factor .- logsumexp(log_factor)) # TODO shift the rest of the code to work in log space
+        factor_node = FactorNode(Int[addr_to_idx(a) for a in var_addrs], factor)
+        idx_to_factor_node[addr_to_idx(addr)] = factor_node
+    end
+
+    # compute children and self
+    children_and_self = [Set{Int}(i) for i in 1:N]
+    for (addr, addr_info) in info
         for parent_addr in addr_info.parent_addrs
-            parent_node = var_nodes_dict[parent_addr]
-            push!(node.parents, parent_node)
-            push!(parent_node.children, node)
+            push!(children_and_self[addr_to_idx(parent_addr)], addr_to_idx(addr))
         end
     end
 
-    # populate factors with values by probing trace with update
-    # the key idea is that this scales exponentially in maximum number of
-    # parents of a variable, not the total number of variables
-
-    # TODO finish
+    # construct factor graph
+    idx_to_var_node = Dict{Int,VarNode}()
     for (addr, addr_info) in info
-        factor = factor_nodes_dict[addr].factor # Array{Float64}, multi-dimensional array
-        for (idx, addrs, values_tuple) in enumerate_values()
-            (_, weight, _, _) = update(trace, _, _, choices)
-            factor[idx] = weight
-        end
-        @assert !isnan(any(factor))
+        factor_nodes = PersistentSet{FactorNode{N}}(
+            [idx_to_factor_node(idx) for idx in children_and_self[addr_to_idx[addr]]])
+        var_node = VarNode{FactorNode{N}}(addr, factor_nodes, addr_info.domain, get_domain_to_idx(addr_info.domain))
+        idx_to_var_node[addr_to_idx[addr]] = var_node
     end
-
-    return FactorGraph(collect(factor_nodes_dict), collect(var_nodes_dict))
+    return FactorGraph(PersistentHashMap{Int,VarNode}(idx_to_var_node), addr_to_idx)
 end
 
 export AddrInfo, compile_trace_to_factor_graph
