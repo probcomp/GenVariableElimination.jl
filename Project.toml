@@ -1,0 +1,8 @@
+name = "GenVariableElimination"
+uuid = "43085b26-f70c-46de-9a56-ba379ae2dc52"
+authors = ["Marco Cusumano-Towner <imarcoam@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+FunctionalCollections = "de31a74c-ac4f-5751-b3fd-e18cd04993ca"
+Gen = "ea4f424c-a589-11e8-07c0-fd5c91b9da4a"
