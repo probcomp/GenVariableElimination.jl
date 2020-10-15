@@ -167,20 +167,25 @@ function conditional_dist(fg::FactorGraph{N}, values::Vector{Any}, addr::Any) wh
     var_idx = addr_to_idx(fg, addr)
     var_node = idx_to_var_node(fg, var_idx)
     n = num_values(var_node)
+    println("conditional_dist, addr: $addr, var_idx: $var_idx, num_values: $n")
     probs = ones(n)
     # TODO : writing the slow version first..
     # LATER: use generated function to generate a version that is specialized to N (unroll this loop, and inline the indices..)
     indices = Vector{Int}(undef, N)
     for i in 1:n
         for factor_node in factor_nodes(var_node)
+            println("i: $i, factor_node.id: $(factor_node.id)")
             F::Array{Float64,N} = factor(factor_node)
             fill!(indices, 1)
             for other_var_idx in vars(factor_node)
+                println("other_var_idx: $other_var_idx")
                 if other_var_idx != var_idx
                     other_var_node = idx_to_var_node(fg, other_var_idx)
                     indices[other_var_idx] = value_to_idx(other_var_node, values[other_var_idx])
                 end
             end
+            indices[var_idx] = i
+            println(indices)
             probs[i] = probs[i] * F[CartesianIndex{N}(indices...)]
         end
     end
@@ -621,6 +626,50 @@ function test_eliminate()
     test_factor_f6(fg, all_factors)
 end
 test_eliminate()
+
+function test_conditional_dist()
+
+    trace = simulate(foo, ())
+    info = Dict{Any,AddrInfo}()
+    info[:x] = AddrInfo([true, false], [])
+    info[:y] = AddrInfo([true, false], [:x])
+    info[:z] = AddrInfo([true, false], [:x, :y])
+    info[:w] = AddrInfo([true, false], [:z])
+    fg = compile_trace_to_factor_graph(trace, info)
+
+    # removes factor f4, replaces it with factor f5
+    fg = eliminate(fg, :w)
+    # removes factors f1, f2, f3, replace them with factor f6
+    fg = eliminate(fg, :x)
+
+    #       x=true              x=false
+    F6 = [  (0.6 * 0.2 * 0.4) + (0.4 * 0.9 * 0.9), # y=true, z=true,
+            (0.6 * 0.2 * 0.6) + (0.4 * 0.9 * 0.1),# y=true, z=false,
+            (0.6 * 0.8 * 0.9) + (0.4 * 0.1 * 0.9),# y=false, z=true,
+            (0.6 * 0.8 * 0.1) + (0.4 * 0.1 * 0.1)# y=false, z=false
+    ]
+
+    #     z=true     z=false
+    F5 = [0.4 + 0.6, 0.5 + 0.5]
+
+    # distribution on z given y
+    values = Vector{Any}(undef, 4)
+    values[addr_to_idx(fg, :y)] = true
+    actual = conditional_dist(fg, values, :z)
+    expected = normed([F6[1] * F5[1], F6[2] * F5[2]])
+    @show actual
+    @show expected
+    @assert isapprox(actual, expected)
+    values[addr_to_idx(fg, :y)] = false
+    actual = conditional_dist(fg, values, :z)
+    expected = normed([F6[3] * F5[1], F6[4] * F5[2]])
+    @show actual
+    @show expected
+    @assert isapprox(actual, expected)
+end
+
+test_conditional_dist()
+
 
 ###########
 # example #
