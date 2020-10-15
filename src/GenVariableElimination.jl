@@ -1,13 +1,12 @@
 module GenVariableElimination
-
 using Gen
 using FunctionalCollections: PersistentSet, PersistentHashMap, dissoc, assoc, conj, disj
+using PyCall
 
 ####################################################
 # factor graph, variable elimination, and sampling #
 ####################################################
 
-# TODO add graphviz visualization of the factor graph
 # TODO use logspace in probability calculations
 # TODO performance optimize?
 # TODO simplify FactorGraph data structure?
@@ -42,6 +41,7 @@ function add_factor_node(node::VarNode{T,V}, factor_node::T) where {T,V}
 end
 
 struct FactorNode{N} # N is the number of variables in the (original) factor graph
+    id::Int
     vars::Vector{Int} # immutable
     factor::Array{Float64,N} # immutable
 end
@@ -50,12 +50,34 @@ vars(node::FactorNode) = node.vars
 factor(node::FactorNode) = node.factor
 
 struct FactorGraph{N}
+    num_factors::Int
     var_nodes::PersistentHashMap{Int,VarNode}
 
     # NOTE: when variables get eliminated from a factor graph, they don't get reindexed
     # (i.e. these fields are unchanged)
     addr_to_idx::Dict{Any,Int} 
 end
+
+function draw_graph(fg::FactorGraph, graphviz, fname)
+    dot = graphviz.Digraph()
+    factor_idx = 1
+    for node in values(fg.var_nodes)
+        shape = "ellipse"
+        color = "white"
+        name = addr(node)
+        dot[:node](name, name, shape=shape, fillcolor=color, style="filled")
+        for factor_node in factor_nodes(node)
+            shape = "box"
+            color = "gray"
+            factor_name = string(factor_node.id)
+            dot[:node](factor_name, factor_name, shape=shape, fillcolor=color, style="filled")
+            dot[:edge](name, factor_name)
+        end
+    end
+    dot[:render](fname, view=true)
+end
+
+export draw_graph
 
 idx_to_var_node(fg::FactorGraph, idx::Int) = fg.var_nodes[idx]
 addr_to_idx(fg::FactorGraph, addr) = fg.addr_to_idx[addr]
@@ -110,7 +132,8 @@ function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
     new_factor = multiply_and_sum(factors_to_combine, eliminated_var)
 
     # add the new factor node
-    new_factor_node = FactorNode{N}(collect(keys(other_involved_var_nodes)), new_factor)
+    new_factor_node = FactorNode{N}(
+        fg.num_factors+1, collect(keys(other_involved_var_nodes)), new_factor)
     for (other_var, other_var_node) in other_involved_var_nodes
         other_involved_var_nodes[other_var] = add_factor_node(other_var_node, new_factor_node)
     end
@@ -123,7 +146,7 @@ function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
         new_var_nodes = assoc(new_var_nodes, other_var, other_var_node)
     end
 
-    return FactorGraph{N}(new_var_nodes, fg.addr_to_idx)
+    return FactorGraph{N}(fg.num_factors+1, new_var_nodes, fg.addr_to_idx)
 end
 
 function conditional_dist(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any) where {N}
@@ -261,6 +284,7 @@ function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
     # construct factor nodes
     N = length(addrs)
     idx_to_factor_node = Vector{FactorNode{N}}(undef, N)
+    factor_id = 1
     for (addr, addr_info) in info
 
         # iterate over our values, and values of our parents, and populate the factor
@@ -297,7 +321,8 @@ function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
         end
 
         factor = exp.(log_factor .- logsumexp(log_factor)) # TODO shift the rest of the code to work in log space
-        factor_node = FactorNode(Int[addr_to_idx[a] for a in var_addrs], factor)
+        factor_node = FactorNode(factor_id, Int[addr_to_idx[a] for a in var_addrs], factor)
+        factor_id += 1
         idx_to_factor_node[addr_to_idx[addr]] = factor_node
     end
 
@@ -317,7 +342,7 @@ function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
         var_node = VarNode(addr, factor_nodes, addr_info.domain, get_domain_to_idx(addr_info.domain))
         var_nodes = assoc(var_nodes, addr_to_idx[addr], var_node)
     end
-    return FactorGraph{N}(var_nodes, addr_to_idx)
+    return FactorGraph{N}(length(idx_to_factor_node), var_nodes, addr_to_idx)
 end
 
 export AddrInfo, compile_trace_to_factor_graph
@@ -388,12 +413,27 @@ info[:x] = AddrInfo([true, false], [])
 info[:y] = AddrInfo([true, false], [:x])
 info[:z] = AddrInfo([true, false], [:x, :y])
 info[:w] = AddrInfo([true, false], [:z])
+# TODO we also need the factors for downstream data that couple them
+# but these aren't associated with a single random choice (and the domain of
+# that choice wouldn't matter, even if they were)
 elimination_order = [:w, :x, :z, :y]
 
 trace = simulate(foo, ())
 
 # test lower level code
 fg = compile_trace_to_factor_graph(trace, info) 
+graphviz = pyimport("graphviz")
+draw_graph(fg, graphviz, "fg1")
+fg = eliminate(fg, :w)
+draw_graph(fg, graphviz, "fg2")
+fg = eliminate(fg, :x)
+draw_graph(fg, graphviz, "fg3")
+fg = eliminate(fg, :z)
+draw_graph(fg, graphviz, "fg4")
+fg = eliminate(fg, :y)
+draw_graph(fg, graphviz, "fg5")
+
+
 println(collect(values(fg.var_nodes)))
 (v, log_prob) = sample_and_compute_log_prob(fg, elimination_order)
 println(v)
