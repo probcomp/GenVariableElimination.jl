@@ -7,6 +7,11 @@ using FunctionalCollections: PersistentSet, PersistentHashMap, dissoc, assoc, co
 # factor graph #
 ################
 
+# TODO add graphviz visualization of the factor graph
+# TODO use logspace in probability calculations
+# TODO performance optimize?
+# TODO simplify FactorGraph data structure?
+
 struct VarNode{T,V} # T would be FactorNode, but for https://github.com/JuliaLang/julia/issues/269
     addr::Any
     factor_nodes::PersistentSet{T}
@@ -42,10 +47,13 @@ factor(node::FactorNode) = node.factor
 
 struct FactorGraph{N}
     var_nodes::PersistentHashMap{Any,VarNode}
-    factor_nodes::PersistentSet{FactorNode{N}} # TODO not needed?
-    addr_to_idx::PersistentHashMap{Any,Int}
-    idx_to_addr::Vector{Any} # TODO
+
+    # NOTE: when variables get eliminated from a factor graph, they don't get reindexed
+    # (i.e. these fields are unchanged)
+    addr_to_idx::Dict{Any,Int} 
 end
+
+addr_to_var(fg::FactorGraph, addr::Any) = fg.var_nodes[addr]
 
 # variable elimination
 # - generates a sequence of factor graphs
@@ -67,14 +75,10 @@ end
 
 function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
     eliminated_var_node = fg.var_nodes[addr]
-    new_factor_nodes = fg.factor_nodes
     factors_to_combine = Vector{Array{Float64,N}}()
     other_involved_var_nodes = Dict{Any,VarNode{FactorNode{N}}}()
     for factor_node in factor_nodes(eliminated_var_node)
         push!(factors_to_combine, factor(factor_node))
-
-        # remove the factor node
-        new_factor_nodes = disj(new_factor_nodes, factor_node)
 
         # remove the reference to this factor node from its variable nodes
         for other_var_node::VarNode{FactorNode{N}} in vars(factor_node)
@@ -95,7 +99,6 @@ function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
 
     # add the new factor node
     new_factor_node = FactorNode{N}(var_nodes_for_new_factor, new_factor)
-    new_factor_nodes = conj(new_factor_nodes, new_factor_node)
     for (a, other_var_node) in var_nodes_for_new_factor
         var_nodes_for_new_factor[a] = add_factor_node(other_var_node, new_factor_node)
     end
@@ -108,30 +111,30 @@ function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
         new_var_nodes = assoc(new_var_nodes, a, other_var_node)
     end
 
-    return FactorGraph{N}(new_var_nodes, new_factor_nodes, fg.addr_to_idx)
+    return FactorGraph{N}(new_var_nodes, fg.addr_to_idx)
 end
 
 function conditional_dist(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any)
-
-    # TODO finish
-
     # other_values must contain a value for all variables that have a factor in
     # common with variable addr in fg
     var_node = fg.var_nodes[addr]
     n = num_values(var_node)
-    # TODO use log space
     probs = ones(n)
-    value_idx_vector = Vector{Int}(undef, N)
-    for node_idx in 1:N
-        other_addr = node_idx_to_addr(fg, node_idx)
-        idx_vector[node_idx] = value_to_idx(fg.var_nodes[other_addr], other_values[other_addr])
-    end
-    for factor_node in factor_nodes(var_node)
-        @assert factor_node in fg.factor_nodes # TODO not needed?
-        f = factor(factor_node)
-        for idx in 1:n
+    # TODO : writing the slow version first..
+    # LATER: use generated function to generate a version that is specialized to N (unroll this loop, and inline the indices..)
+    indices = Vector{Int}(undef, N)
+    for i in 1:n
+        for factor_node in factor_nodes(var_node)
+            F::Array{Float64,N} = factor(factor_node)
+            fill!(indices, 1)
+            for (addr, value) in other_values
+                other_var_node = addr_to_var(fg, addr)
+                indices[addr_to_var(fg, addr)] = value_to_idx(other_var_node, value)
+            end
+            probs[i] = probs[i] * F[CartesianIndex{N}(indices...)]
         end
     end
+    return probs
 end
 
 function sample_and_compute_log_prob_addr(fg::FactorGraph{N}, other_values::Dict{Any,Any}, addr::Any)
@@ -192,13 +195,16 @@ end
 
 # constructor from trace and addr info (queries trace with update)
 
+#########################################
+# compiling a trace into a factor graph #
+#########################################
+
 struct AddrInfo{T,U}
     domain::Vector{T}
     parent_addrs::Vector{U}
 end
 
-
-function to_factor_graph(trace, info::Dict{Any,AddrInfo})
+function compile_trace_to_factor_graph(trace, info::Dict{Any,AddrInfo})
     var_nodes_dict = Dict{Any,VarNode}()
     factor_nodes_dict = Dict{Any,FactorNode}()
 
@@ -219,6 +225,9 @@ function to_factor_graph(trace, info::Dict{Any,AddrInfo})
     end
 
     # populate factors with values by probing trace with update
+    # the key idea is that this scales exponentially in maximum number of
+    # parents of a variable, not the total number of variables
+
     # TODO finish
     for (addr, addr_info) in info
         factor = factor_nodes_dict[addr].factor # Array{Float64}, multi-dimensional array
@@ -232,9 +241,11 @@ function to_factor_graph(trace, info::Dict{Any,AddrInfo})
     return FactorGraph(collect(factor_nodes_dict), collect(var_nodes_dict))
 end
 
-####################################
-# wrap it in a generative function #
-####################################
+export AddrInfo, compile_trace_to_factor_graph
+
+###############################
+# generative function wrapper #
+###############################
 
 struct FactorGraphSamplerTrace
     fg::FactorGraph
@@ -250,7 +261,7 @@ const compile_and_sample_factor_graph = FactorGraphSampler()
 
 function Gen.simulate(gen_fn::FactorGraphSampler, args::Tuple)
     (model_trace, info, elimination_order) = args
-    fg = compile_factor_graph(model_trace, info)
+    fg = compile_trace_to_factor_graph(model_trace, info)
     (values, log_prob) = sample_and_compute_log_prob(fg, elimination_order)
     choices = choicemap()
     for (addr, value) in values
@@ -261,7 +272,7 @@ end
 
 function Gen.generate(gen_fn::FactorGraphSampler, args::Tuple, choices::ChoiceMap)
     (model_trace, info, elimination_order) = args
-    fg = compile_factor_graph(model_trace, info)
+    fg = compile_trace_to_factor_graph(model_trace, info)
     values = Dict{Any,Any}()
     for addr in keys(info)
         values[addr] = choices[addr]
@@ -280,9 +291,11 @@ Gen.project(trace::FactorGraphSampler, ::EmptyChoiceMap) = 0.0
 Gen.has_argument_grads(gen_fn::FactorGraphSampler) = (false, false, false)
 Gen.accepts_output_grad(gen_fn::FactorGraphSampler) = false
 
-###############################################
-# step 1: compile a trace into a factor graph #
-###############################################
+export compile_and_sample_factor_graph
+
+###########
+# example #
+###########
 
 @gen function foo()
     x ~ bernoulli(0.5)
@@ -296,9 +309,18 @@ info[:x] = AddrInfo([true, false], [])
 info[:y] = AddrInfo([true, false], [:x])
 info[:z] = AddrInfo([true, false], [:x, :y])
 info[:w] = AddrInfo([true, false], [:z])
+elimination_order = [:w, :x, :z, :y]
 
 trace = simulate(foo, ())
 
-fg = to_factor_graph(trace, info)
+# test lower level code
+fg = compile_trace_to_factor_graph(trace, info) 
+(values, log_prob) = sample_and_compute_log_prob(fg, elimination_orer)
+println(values)
+println(log_prob)
+
+# test generative function wrapper
+trace, accepted = mh(trace, compile_and_sample_factor_graph, (info, elimination_order))
+@assert accepted
 
 end # module
