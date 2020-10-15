@@ -9,7 +9,6 @@ using PyCall
 
 # TODO use logspace in probability calculations
 # TODO performance optimize?
-# TODO simplify FactorGraph data structure?
 
 # TODO make the generative function accept the precompiled factor graph (with elimination already run), not the trace
 # that way we can sample multiple times without having to re-run compilation or variable elimination each time
@@ -193,58 +192,23 @@ function conditional_dist(fg::FactorGraph{N}, values::Vector{Any}, addr::Any) wh
 end
 
 function sample_and_compute_log_prob_addr(fg::FactorGraph, values::Vector{Any}, addr::Any)
-    dist = conditional_dist(fg, values, addr)
-    idx = categorical(dist)
-    value = idx_to_value(idx_to_var_node(fg, addr_to_idx(fg, addr)), idx)
-    return (value, log(dist[idx]))
 end
 
-function compute_log_prob_addr(fg::FactorGraph, values::Vector{Any}, addr::Any, value::Any)
-    dist = conditional_dist(fg, values, addr)
-    idx = value_to_idx(idx_to_var_node(fg, addr_to_idx(fg, addr)), value)
-    return log(dist[idx])
+# KEY API method
+
+struct VariableEliminationResult{N}
+    elimination_order::Any
+    intermediate_fgs::Vector{FactorGraph{N}}
 end
 
-function sample_and_compute_log_prob(fg::FactorGraph{N}, elimination_order) where {N}
+function variable_elimination(fg::FactorGraph{N}, elimination_order) where {N}
     intermediate_fgs = Vector{FactorGraph{N}}(undef, N)
     for addr in elimination_order
         var_idx = addr_to_idx(fg, addr)
         intermediate_fgs[var_idx] = fg
         fg = eliminate(fg, addr)
     end
-    values = Vector{Any}(undef, N)
-    total_log_prob = 0.0
-    for addr in reverse(elimination_order)
-        var_idx = addr_to_idx(fg, addr)
-        fg = intermediate_fgs[var_idx]
-        (values[var_idx], log_prob) = sample_and_compute_log_prob_addr(fg, values, addr)
-        total_log_prob += log_prob
-    end
-    addr_to_value = Dict{Any,Any}()
-    for addr in elimination_order
-        addr_to_value[addr] = values[addr_to_idx(fg, addr)]
-    end
-    return (addr_to_value, total_log_prob)
-end
-
-function compute_log_prob(fg::FactorGraph{N}, elimination_order, addr_to_value::Dict{Any,Any}) where {N}
-    intermediate_fgs = Vector{FactorGraph{N}}(undef, N)
-    for addr in elimination_order
-        var_idx = addr_to_idx(fg, addr)
-        intermediate_fgs[var_idx] = fg
-        fg = eliminate(fg, addr)
-    end
-    values = Vector{Any}(undef, N)
-    for addr in elimination_order
-        values[addr_to_idx(fg, addr)] = addr_to_value[addr]
-    end
-    total_log_prob = 0.0
-    for addr in reverse(elimination_order)
-        fg = intermediate_fgs[addr_to_idx(fg, addr)]
-        log_prob = compute_log_prob_addr(fg, values, addr, addr_to_value[addr])
-        total_log_prob += log_prob
-    end
-    return total_log_prob
+    return VariableEliminationResult(elimination_order, intermediate_fgs)
 end
 
 # sampling and joint probability given variable elimination sequence - 
@@ -401,55 +365,122 @@ end
 
 export Latent, compile_trace_to_factor_graph
 
-###############################
-# generative function wrapper #
-###############################
+################################
+# generative function wrappers #
+################################
 
-struct FactorGraphSamplerTrace <: Gen.Trace
+# just sample a precompiled and eliminated factor graph
+
+struct SampleFactorGraphTrace <: Gen.Trace
+    fg::FactorGraph
+    args::Tuple{FactorGraph,VariableEliminationResult}
+    choices::Gen.DynamicChoiceMap
+    log_prob::Float64
+end
+
+struct SampleFactorGraph <: GenerativeFunction{Nothing,SampleFactorGraphTrace}
+end
+
+const sample_factor_graph = SampleFactorGraph()
+
+function Gen.simulate(
+        ::SampleFactorGraph,
+        args::Tuple{FactorGraph{N},VariableEliminationResult}) where {N}
+    (fg, elimination_result) = args
+    choices = choicemap()
+    values = Vector{Any}(undef, N)
+    log_prob = 0.0
+    for addr in reverse(elimination_result.elimination_order)
+        var_idx = addr_to_idx(fg, addr)
+        fg = elimination_result.intermediate_fgs[var_idx]
+        dist = conditional_dist(fg, values, addr)
+        idx = categorical(dist)
+        value = idx_to_value(idx_to_var_node(fg, addr_to_idx(fg, addr)), idx)
+        values[var_idx] = value
+        choices[addr] = value
+        log_prob += log(dist[idx])
+    end
+    return SampleFactorGraphTrace(fg, args, choices, log_prob)
+end
+
+function Gen.generate(  
+        ::SampleFactorGraph,
+        args::Tuple{FactorGraph{N},VariableEliminationResult},
+        choices::ChoiceMap) where {N}
+    (fg, elimination_result) = args
+    values = Vector{Any}(undef, N)
+    for addr in elimination_result.elimination_order
+        values[addr_to_idx(fg, addr)] = choices[addr]
+    end
+    log_prob = 0.0
+    for addr in reverse(elimination_result.elimination_order)
+        fg = elimination_result.intermediate_fgs[addr_to_idx(fg, addr)]
+        dist = conditional_dist(fg, values, addr)
+        idx = value_to_idx(idx_to_var_node(fg, addr_to_idx(fg, addr)), values[addr_to_idx(fg, addr)])
+        log_prob += log(dist[idx])
+    end
+    trace = SampleFactorGraphTrace(fg, args, choices, log_prob)
+    return (trace, log_prob)
+end
+
+Gen.get_args(trace::SampleFactorGraphTrace) = trace.args
+Gen.get_retval(trace::SampleFactorGraphTrace) = nothing
+Gen.get_choices(trace::SampleFactorGraphTrace) = trace.choices
+Gen.get_score(trace::SampleFactorGraphTrace) = trace.log_prob
+Gen.get_gen_fn(trace::SampleFactorGraphTrace) = sample_factor_graph
+Gen.project(trace::SampleFactorGraphTrace, ::EmptyChoiceMap) = 0.0
+Gen.has_argument_grads(::SampleFactorGraph) = (false, false, false)
+Gen.accepts_output_grad(::SampleFactorGraph) = false
+
+export sample_factor_graph
+
+# compile a factor graph from a trace, run variable elimination, and sample
+# from the factor graph
+
+struct CompileAndSampleFactorGraphTrace <: Gen.Trace
     fg::FactorGraph
     args::Tuple{Gen.Trace,Dict{Any,Latent},Dict{Any,Observation},Any}
     choices::Gen.DynamicChoiceMap
     log_prob::Float64
 end
 
-struct FactorGraphSampler <: GenerativeFunction{Nothing,FactorGraphSamplerTrace}
+struct CompileAndSampleFactorGraph <: GenerativeFunction{Nothing,CompileAndSampleFactorGraphTrace}
 end
 
-const compile_and_sample_factor_graph = FactorGraphSampler()
+const compile_and_sample_factor_graph = CompileAndSampleFactorGraph()
 
-function Gen.simulate(gen_fn::FactorGraphSampler, args::Tuple)
-    (model_trace, latents, observations, elimination_order) = args
-    fg = compile_trace_to_factor_graph(model_trace, latents, observations)
-    (values, log_prob) = sample_and_compute_log_prob(fg, elimination_order)
-    choices = choicemap()
-    for (addr, value) in values
-        choices[addr] = value
-    end
-    return FactorGraphSamplerTrace(fg, args, choices, log_prob)
+function Gen.simulate(
+        ::CompileAndSampleFactorGraph,
+        args::Tuple{Gen.Trace,Dict{Any,Latent},Dict{Any,Observation},Any})
+    (trace, latents, observations, elimination_order) = args
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+    elimination_result = variable_elimination(fg, elimination_order)
+    trace = Gen.simulate(sample_factor_graph, (fg, elimination_result))
+    return CompileAndSampleFactorGraphTrace(fg, args, get_choices(trace), get_score(trace))
 end
 
-function Gen.generate(gen_fn::FactorGraphSampler, args::Tuple, choices::ChoiceMap)
-    (model_trace, latents, observations, elimination_order) = args
-    fg = compile_trace_to_factor_graph(model_trace, latents, observations)
-    values = Dict{Any,Any}()
-    for addr in keys(latents)
-        values[addr] = choices[addr]
-    end
-    log_prob = compute_log_prob(fg, elimination_order, values)
-    trace = FactorGraphSamplerTrace(fg, args, choices, log_prob)
-    return (trace, log_prob)
+function Gen.generate(
+        ::CompileAndSampleFactorGraph,
+        args::Tuple{Gen.Trace,Dict{Any,Latent},Dict{Any,Observation},Any},
+        choices::ChoiceMap)
+    (trace, latents, observations, elimination_order) = args
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+    elimination_result = variable_elimination(fg, elimination_order)
+    trace, weight = Gen.generate(sample_factor_graph, (fg, elimination_result), choices)
+    return (CompileAndSampleFactorGraphTrace(fg, args, get_choices(trace), get_score(trace)), weight)
 end
 
-Gen.get_args(trace::FactorGraphSamplerTrace) = trace.args
-Gen.get_retval(trace::FactorGraphSamplerTrace) = nothing
-Gen.get_choices(trace::FactorGraphSamplerTrace) = trace.choices
-Gen.get_score(trace::FactorGraphSamplerTrace) = trace.log_prob
-Gen.get_gen_fn(trace::FactorGraphSamplerTrace) = compile_and_sample_factor_graph
-Gen.project(trace::FactorGraphSamplerTrace, ::EmptyChoiceMap) = 0.0
-Gen.has_argument_grads(gen_fn::FactorGraphSampler) = (false, false, false)
-Gen.accepts_output_grad(gen_fn::FactorGraphSampler) = false
+Gen.get_args(trace::CompileAndSampleFactorGraphTrace) = trace.args
+Gen.get_retval(trace::CompileAndSampleFactorGraphTrace) = nothing
+Gen.get_choices(trace::CompileAndSampleFactorGraphTrace) = trace.choices
+Gen.get_score(trace::CompileAndSampleFactorGraphTrace) = trace.log_prob
+Gen.get_gen_fn(trace::CompileAndSampleFactorGraphTrace) = sample_factor_graph
+Gen.project(trace::CompileAndSampleFactorGraphTrace, ::EmptyChoiceMap) = 0.0
+Gen.has_argument_grads(::CompileAndSampleFactorGraph) = (false, false, false)
+Gen.accepts_output_grad(::CompileAndSampleFactorGraph) = false
 
 export compile_and_sample_factor_graph
+
 
 #########
 # tests #
@@ -720,11 +751,7 @@ function test_mh_accepted()
     latents[:w] = Latent([true, false], [:z])
     observations = Dict{Any,Observation}()
     observations[:obs] = Observation([:x, :w])
-    #fg = compile_trace_to_factor_graph(trace, latents, observations)
 
-    # TODO we also need the factors for downstream data that couple them
-    # but these aren't associated with a single random choice (and the domain of
-    # that choice wouldn't matter, even if they were)
     elimination_order = [:w, :x, :z, :y]
     
     trace = simulate(foo, ())
