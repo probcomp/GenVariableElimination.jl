@@ -285,3 +285,51 @@ end
     end
 
 end
+
+@testset "HMM forward-filtering backwards sampling" begin
+
+    # three hidden states, three observed states
+    prior = rand(3)
+    prior = prior / sum(prior)
+
+    A = rand(3, 3)
+    A = A ./ sum(A, dims=2)
+
+    B = rand(3, 3)
+    B = B ./ sum(B, dims=2)
+
+    T = 10
+
+    @gen function hmm()
+        z = ({(:z, 1)} ~ categorical(prior))
+        {(:x, 1)} ~ categorical(B[z,:])
+        for t in 2:T
+            z = ({(:z, t)} ~ categorical(A[z,:]))
+            {(:x, t)} ~ categorical(B[z,:])
+        end
+    end
+
+    latents = Dict{Any,Latent}()
+    latents[(:z, 1)] = Latent(collect(1:3), [])
+    for t in 2:T
+        latents[(:z, t)] = Latent(collect(1:3), [(:z, t-1)])
+    end
+    observations = Dict{Any,Observation}()
+    for t in 1:T
+        observations[(:x, t)] = Observation([(:z, t)])
+    end
+
+    elimination_order = Any[]
+    for t in 1:T
+        push!(elimination_order, (:z, t))
+    end
+
+    trace = simulate(hmm, ())
+
+    for i in 1:10
+        # NOTE: in this case, it is actually unecessary to recompile the factor graph on each iteration
+        trace, accepted = mh(trace, compile_and_sample_factor_graph, (latents, observations, elimination_order))
+        @test accepted
+    end
+
+end
