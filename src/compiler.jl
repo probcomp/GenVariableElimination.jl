@@ -79,20 +79,25 @@ function create_factor(
     # the key idea is that this scales exponentially in maximum number of
     # parents of a variable, not the total number of variables
 
-    for value_idx_tuple in cartesian_product(value_idx_lists)
+    cprod = cartesian_product(value_idx_lists)
+    for value_idx_tuple in cprod
         choices = choicemap()
         for (a, value_idx) in zip(var_addrs, value_idx_tuple)
             choices[a] = latents[a].domain[value_idx]
         end
         (tmp_trace, _, _, _) = update(trace, get_args(trace), map((_)->NoChange(),get_args(trace)), choices)
-        # NOTE: semantics of project not exactly aligned -- since project can use any proposal...
+        # NOTE: technically, the generative function of trace can use any
+        # internal proposal, not only forward sampling, but this code is only
+        # correct if the internal proposal uses forward sampling. enhancing the
+        # trace interface with some more methods that specifically assume a
+        # dependency graph would resolve this
         weight = project(tmp_trace, select(addr))
         log_factor_view[value_idx_tuple...] = weight
     end
 
-    factor = exp.(log_factor .- logsumexp(log_factor[:])) # TODO shift the rest of the code to work in log space
+    log_factor = log_factor .- logsumexp(log_factor[:])
 
-    return (factor, var_addrs)
+    return (log_factor, var_addrs)
 end
 
 function compile_trace_to_factor_graph(
@@ -111,9 +116,9 @@ function compile_trace_to_factor_graph(
     addr_to_factor_node = Dict{Any,FactorNode{N}}()
     factor_id = 1
     for addr in Iterators.flatten((keys(latents), keys(observations)))
-        (factor, var_addrs) = create_factor(
+        (log_factor, var_addrs) = create_factor(
             trace, addr, latents, observations, all_latent_addrs)
-        addr_to_factor_node[addr] = FactorNode{N}(factor_id, Int[latent_addr_to_idx[a] for a in var_addrs], factor)
+        addr_to_factor_node[addr] = FactorNode{N}(factor_id, Int[latent_addr_to_idx[a] for a in var_addrs], log_factor)
         factor_id += 1
     end
     num_factors = factor_id - 1

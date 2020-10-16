@@ -2,7 +2,9 @@
 # generative function wrappers #
 ################################
 
-# just sample a precompiled and eliminated factor graph
+# generative function that takes a factor graph and the result of variable
+# elimination and samples from the conditional distribution on the latent
+# variables
 
 struct SampleFactorGraphTrace <: Gen.Trace
     fg::FactorGraph
@@ -52,7 +54,7 @@ function Gen.generate(
         idx = value_to_idx(idx_to_var_node(fg, addr_to_idx(fg, addr)), values[addr_to_idx(fg, addr)])
         log_prob += log(dist[idx])
     end
-    trace = SampleFactorGraphTrace(fg, args, choices, log_prob)
+    trace = SampleFactorGraphTrace(fg, args, DynamicChoiceMap(choices), log_prob)
     return (trace, log_prob)
 end
 
@@ -61,13 +63,23 @@ Gen.get_retval(trace::SampleFactorGraphTrace) = nothing
 Gen.get_choices(trace::SampleFactorGraphTrace) = trace.choices
 Gen.get_score(trace::SampleFactorGraphTrace) = trace.log_prob
 Gen.get_gen_fn(trace::SampleFactorGraphTrace) = sample_factor_graph
-Gen.project(trace::SampleFactorGraphTrace, ::EmptyChoiceMap) = 0.0
+Gen.project(trace::SampleFactorGraphTrace, ::EmptySelection) = 0.0
 Gen.has_argument_grads(::SampleFactorGraph) = (false, false, false)
 Gen.accepts_output_grad(::SampleFactorGraph) = false
 
+# TODO: to use this as an MH proposal, it must take its first argument to be a trace
+# ideally, we could wrap it in another generatiev function like this:
 
-# compile a factor graph from a trace, run variable elimination, and sample
-# from the factor graph
+#@gen function mh_proposal(trace, fg, elimination_result)
+    #{*} ~ sample_factor_graph(fg, elimination_result)
+#end
+
+# however, this is not supported...
+# we could embed it in involutive MH, but unfortunately that requires some code
+# in principle, it should be possible to do this without requiring any user code.
+
+# generative function that takes a trace and compiles and samples from the
+# conditional distribution on the latent variables
 
 struct CompileAndSampleFactorGraphTrace <: Gen.Trace
     fg::FactorGraph
@@ -107,6 +119,6 @@ Gen.get_retval(trace::CompileAndSampleFactorGraphTrace) = nothing
 Gen.get_choices(trace::CompileAndSampleFactorGraphTrace) = trace.choices
 Gen.get_score(trace::CompileAndSampleFactorGraphTrace) = trace.log_prob
 Gen.get_gen_fn(trace::CompileAndSampleFactorGraphTrace) = sample_factor_graph
-Gen.project(trace::CompileAndSampleFactorGraphTrace, ::EmptyChoiceMap) = 0.0
+Gen.project(trace::CompileAndSampleFactorGraphTrace, ::EmptySelection) = 0.0
 Gen.has_argument_grads(::CompileAndSampleFactorGraph) = (false, false, false)
 Gen.accepts_output_grad(::CompileAndSampleFactorGraph) = false
