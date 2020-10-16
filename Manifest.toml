@@ -77,7 +77,9 @@ version = "0.5.0"
 
 [[Gen]]
 deps = ["DataStructures", "Distributions", "ForwardDiff", "FunctionalCollections", "JSON", "LinearAlgebra", "MacroTools", "Parameters", "Random", "ReverseDiff", "SpecialFunctions"]
-path = "/home/marcoct/dev/Gen"
+git-tree-sha1 = "e383d83ce5c2906cbd3276b6fcf33eb0a39deadf"
+repo-rev = "master"
+repo-url = "https://github.com/probcomp/Gen.jl.git"
 uuid = "ea4f424c-a589-11e8-07c0-fd5c91b9da4a"
 version = "0.3.5"
 
