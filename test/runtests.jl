@@ -279,9 +279,16 @@ end
     
     trace = simulate(foo, ())
 
+    function mh_log_acceptance_ratio(trace)
+        forward_trace = simulate(compile_and_sample_factor_graph, (trace, latents, observations, elimination_order))
+        (new_trace, weight, _, discard) = update(trace, get_args(trace), map((_) -> NoChange(), get_args(trace)), get_choices(forward_trace))
+        (backward_trace, _) = generate(compile_and_sample_factor_graph, (trace, latents, observations, elimination_order), discard)
+        return weight + get_score(backward_trace) - get_score(forward_trace)
+    end
+
     for i in 1:100
-        trace, accepted = mh(trace, compile_and_sample_factor_graph, (latents, observations, elimination_order))
-        @test accepted
+        log_ratio = mh_log_acceptance_ratio(trace)
+        @test abs(log_ratio) < 1e-10
     end
 
 end
