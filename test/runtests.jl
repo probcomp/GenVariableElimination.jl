@@ -18,6 +18,63 @@ vars = GenVariableElimination.vars
 factor_value = GenVariableElimination.factor_value
 eliminate = GenVariableElimination.eliminate
 
+
+###### static example #####
+
+function compute_next_probs(x1)
+    probs = fill(1/20, 20)
+    probs[x1] *= 10
+    return probs ./ sum(probs)
+end
+
+
+@gen (static) function static_model()
+    p1 ~ beta(0.5, 0.5)
+    p2 ~ beta(0.5, 0.5)
+    p3 ~ beta(0.5, 0.5)
+    x1 ~ uniform_discrete(1, 20)
+    x2 ~ categorical(compute_next_probs(x1))
+    x3 ~ categorical(compute_next_probs(x2))
+    x4 ~ categorical(compute_next_probs(x3))
+    x5 ~ categorical(compute_next_probs(x4))
+    x6 ~ categorical(compute_next_probs(x5))
+    x7 ~ bernoulli(x6 > 5 ? p2 : p3)
+    x8 ~ bernoulli(x7 ? p2 : p3)
+    x9 ~ bernoulli(x8 ? p2 : p3)
+    x10 ~ bernoulli(x9 ? p2 : p3)
+    x11 ~ bernoulli(x10 ? p2 : p3)
+    x12 ~ bernoulli(x11 ? p2 : p3)
+    x13 ~ bernoulli(x12 ? p2 : p3)
+    x14 ~ bernoulli(x13 ? p2 : p3)
+    x15 ~ bernoulli(x14 ? p2 : p3)
+    x16 ~ bernoulli(x15 ? p2 : p3)
+    x17 ~ bernoulli(x16 ? p2 : p3)
+    x18 ~ bernoulli(x17 ? p2 : p3)
+    x19 ~ bernoulli(x18 ? p2 : p3)
+    x20 ~ bernoulli(x19 ? 0.5 : 0.1)
+end
+
+@load_generated_functions()
+
+@testset "static IR" begin
+
+    trace = simulate(static_model, ())
+
+    (ret_ancestors, latents, observations) = GenVariableElimination.forward_analysis(trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
+    println(ret_ancestors)
+    println(latents)
+    println(observations)
+    
+    sampler = generate_conditional_sampler(trace, [:x1, :x2, :x3])
+    for i in 1:100
+        @time trace, acc = mh(trace, sampler, ())
+        @assert acc
+    end
+end
+
+
+# end #
+
 @gen function foo()
     x ~ bernoulli(0.6)
     y ~ bernoulli(x ? 0.2 : 0.9)
@@ -340,3 +397,5 @@ end
     end
 
 end
+
+
