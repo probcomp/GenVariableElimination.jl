@@ -2,7 +2,7 @@
 
 [![Build Status](https://travis-ci.com/probcomp/GenVariableElimination.jl.svg?branch=main)](https://travis-ci.com/probcomp/GenVariableElimination.jl)
 
-WARNING: This package is experimental research code. The API is not stable, and it has not been not performance-tuned.
+WARNING: This package is experimental. The API is not stable, and it has not been not performance-tuned.
 
 This package includes several components:
 
