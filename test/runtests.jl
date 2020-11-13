@@ -54,24 +54,65 @@ end
     x20 ~ bernoulli(x19 ? 0.5 : 0.1)
 end
 
+# three hidden states, three observed states
+prior = rand(3)
+prior = prior / sum(prior)
+
+A = rand(3, 3)
+A = A ./ sum(A, dims=2)
+
+B = rand(3, 3)
+B = B ./ sum(B, dims=2)
+
+@gen (static) function step(t::Int, z_prev::Int)
+    z ~ categorical(A[z_prev,:])
+    x ~ categorical(B[z,:])
+    return z
+end
+
+@gen (static) function hmm(T::Int)
+    z_init ~ categorical(prior)
+    x_init ~ categorical(B[z_init,:])
+    steps ~ (Unfold(step))(T, z_init)
+end
+
 @load_generated_functions()
 
-@testset "static IR" begin
+#@testset "static IR basic block" begin
+#
+    #trace = simulate(static_model, ())
+#
+    #(ret_ancestors, latents, observations) = GenVariableElimination.forward_analysis(
+        #trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
+    #println(ret_ancestors)
+    #println(latents)
+    #println(observations)
+    #
+    #sampler = generate_conditional_sampler(trace, [:x1, :x2, :x3])
+    #for i in 1:100
+        #@time trace, acc = mh(trace, sampler, ())
+        #@test acc
+    #end
+#
+#end
 
-    trace = simulate(static_model, ())
+@testset "static IR + unfold HMM" begin
 
-    (ret_ancestors, latents, observations) = GenVariableElimination.forward_analysis(trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
+    trace = simulate(hmm, (20,))
+
+    (ret_ancestors, latents, observations) = GenVariableElimination.forward_analysis(
+        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z], (), [Set{Any}()])
     println(ret_ancestors)
     println(latents)
     println(observations)
     
-    sampler = generate_conditional_sampler(trace, [:x1, :x2, :x3])
+    sampler = generate_conditional_sampler(trace, [:z_init, (:steps => t => :z for t in 1:20)...])
     for i in 1:100
         @time trace, acc = mh(trace, sampler, ())
-        @assert acc
+        @test acc
     end
-end
 
+end
 
 # end #
 
