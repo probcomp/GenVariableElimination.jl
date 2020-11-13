@@ -2,6 +2,10 @@ using Test
 using Gen
 using GenVariableElimination
 
+#####################################################################
+# test internals (constructing factor graphs, variable elimination) #
+#####################################################################
+
 # TODO: these tests poke around at the guts of internal data structures
 # the data structures should be refactored and perhaps
 # tests should be replaced with higher level tests of the API
@@ -17,120 +21,6 @@ factor_nodes = GenVariableElimination.factor_nodes
 vars = GenVariableElimination.vars
 factor_value = GenVariableElimination.factor_value
 eliminate = GenVariableElimination.eliminate
-
-
-###### static example #####
-
-function compute_next_probs(x1)
-    probs = fill(1/20, 20)
-    probs[x1] *= 10
-    return probs ./ sum(probs)
-end
-
-
-@gen (static) function static_model()
-    p1 ~ beta(0.5, 0.5)
-    p2 ~ beta(0.5, 0.5)
-    p3 ~ beta(0.5, 0.5)
-    x1 ~ uniform_discrete(1, 20)
-    x2 ~ categorical(compute_next_probs(x1))
-    x3 ~ categorical(compute_next_probs(x2))
-    x4 ~ categorical(compute_next_probs(x3))
-    x5 ~ categorical(compute_next_probs(x4))
-    x6 ~ categorical(compute_next_probs(x5))
-    x7 ~ bernoulli(x6 > 5 ? p2 : p3)
-    x8 ~ bernoulli(x7 ? p2 : p3)
-    x9 ~ bernoulli(x8 ? p2 : p3)
-    x10 ~ bernoulli(x9 ? p2 : p3)
-    x11 ~ bernoulli(x10 ? p2 : p3)
-    x12 ~ bernoulli(x11 ? p2 : p3)
-    x13 ~ bernoulli(x12 ? p2 : p3)
-    x14 ~ bernoulli(x13 ? p2 : p3)
-    x15 ~ bernoulli(x14 ? p2 : p3)
-    x16 ~ bernoulli(x15 ? p2 : p3)
-    x17 ~ bernoulli(x16 ? p2 : p3)
-    x18 ~ bernoulli(x17 ? p2 : p3)
-    x19 ~ bernoulli(x18 ? p2 : p3)
-    x20 ~ bernoulli(x19 ? 0.5 : 0.1)
-end
-
-# three hidden states, three observed states
-prior = rand(3)
-prior = prior / sum(prior)
-
-A = rand(3, 3)
-A = A ./ sum(A, dims=2)
-
-B = rand(3, 3)
-B = B ./ sum(B, dims=2)
-
-@gen (static) function step(t::Int, z_prev::Int)
-    z ~ categorical(A[z_prev,:])
-    x ~ categorical(B[z,:])
-    return z
-end
-
-@gen (static) function hmm(T::Int)
-    z_init ~ categorical(prior)
-    x_init ~ categorical(B[z_init,:])
-    steps ~ (Unfold(step))(T, z_init)
-end
-
-@load_generated_functions()
-
-@testset "static IR basic block" begin
-
-    trace = simulate(static_model, ())
-
-    (ret_ancestors, latents, observations) = factor_graph_analysis(
-        trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
-    
-    sampler = generate_backwards_sampler(trace, [:x1, :x2, :x3])
-    for i in 1:100
-        trace, acc = mh(trace, sampler, ())
-        @test acc
-    end
-
-end
-
-@testset "static IR + unfold HMM" begin
-
-    trace = simulate(hmm, (10,))
-
-    (ret_ancestors, latents, observations) = factor_graph_analysis(
-        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z], (), [Set{Any}()])
-    
-    sampler = generate_backwards_sampler(trace, [:z_init, (:steps => t => :z for t in 1:10)...])
-    for i in 1:100
-        trace, acc = mh(trace, sampler, ())
-        @test acc
-    end
-
-end
-
-@testset "generate backwards sampler fixed trace" begin
-    T = 10
-    trace = simulate(hmm, (T,))
-    observations = choicemap()
-    observations[:x_init] = trace[:x_init]
-    for t in 1:T
-        observations[:steps => t => :x] = trace[:steps => t => :x]
-    end
-
-    sampler = generate_backwards_sampler_fixed_trace(trace, [:z_init, (:steps => t => :z for t in 1:T)...])
-
-    # since sampler is the exact conditional distribution, importance sampling
-    # yields deterministic exact log marginal likelihood
-    q_tr1 = simulate(sampler, ())
-    p_tr1, = generate(hmm, (T,), merge(observations, get_choices(q_tr1)))
-    q_tr2 = simulate(sampler, ())
-    p_tr2, = generate(hmm, (T,), merge(observations, get_choices(q_tr2)))
-    logml1 = get_score(p_tr1) - get_score(q_tr1)
-    logml2 = get_score(p_tr2) - get_score(q_tr2)
-    @test isapprox(logml1, logml2)
-end
-
-# end #
 
 @gen function foo()
     x ~ bernoulli(0.6)
@@ -237,7 +127,6 @@ function test_factor_f6(fg, all_factors)
         (0.6 * 0.8 * 0.1) + (0.4 * 0.1 * 0.1)# y=false, z=false
     ]))
 end
-
 
 @testset "compiling factor graph from trace" begin
 
@@ -370,6 +259,10 @@ end
     @test isapprox(actual, expected)
 end
 
+#######################################
+# generating samplers from DML traces #
+#######################################
+
 @testset "MH always accepts" begin
 
     @gen function bar()
@@ -455,4 +348,149 @@ end
 
 end
 
+###################
+# SML basic block #
+###################
 
+function compute_next_probs(x1)
+    probs = fill(1/20, 20)
+    probs[x1] *= 10
+    return probs ./ sum(probs)
+end
+
+@gen (static) function static_model()
+    p1 ~ beta(0.5, 0.5)
+    p2 ~ beta(0.5, 0.5)
+    p3 ~ beta(0.5, 0.5)
+    x1 ~ uniform_discrete(1, 20)
+    x2 ~ categorical(compute_next_probs(x1))
+    x3 ~ categorical(compute_next_probs(x2))
+    x4 ~ categorical(compute_next_probs(x3))
+    x5 ~ categorical(compute_next_probs(x4))
+    x6 ~ categorical(compute_next_probs(x5))
+    x7 ~ bernoulli(x6 > 5 ? p2 : p3)
+    x8 ~ bernoulli(x7 ? p2 : p3)
+    x9 ~ bernoulli(x8 ? p2 : p3)
+    x10 ~ bernoulli(x9 ? p2 : p3)
+    x11 ~ bernoulli(x10 ? p2 : p3)
+    x12 ~ bernoulli(x11 ? p2 : p3)
+    x13 ~ bernoulli(x12 ? p2 : p3)
+    x14 ~ bernoulli(x13 ? p2 : p3)
+    x15 ~ bernoulli(x14 ? p2 : p3)
+    x16 ~ bernoulli(x15 ? p2 : p3)
+    x17 ~ bernoulli(x16 ? p2 : p3)
+    x18 ~ bernoulli(x17 ? p2 : p3)
+    x19 ~ bernoulli(x18 ? p2 : p3)
+    x20 ~ bernoulli(x19 ? 0.5 : 0.1)
+end
+
+@load_generated_functions()
+
+@testset "SML basic block" begin
+
+    trace = simulate(static_model, ())
+
+    (ret_ancestors, latents, observations) = factor_graph_analysis(
+        trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
+    
+    sampler = generate_backwards_sampler(trace, [:x1, :x2, :x3])
+    for i in 1:100
+        trace, acc = mh(trace, sampler, ())
+        @test acc
+    end
+
+end
+
+
+#######
+# Map #
+#######
+
+@gen (static) function local_model(inlier_mean)
+    z ~ bernoulli(0.5)
+    x ~ normal(z ? inlier_mean : 0.0, z ? 1.0 : 10.0)
+end
+
+@gen (static) function global_model(n)
+    inlier_mean ~ normal(0, 10.0)
+    data ~ Map(local_model)(fill(inlier_mean, n))
+end
+
+@load_generated_functions()
+
+@testset "Map" begin
+    n = 10
+    trace = simulate(global_model, (n,))
+    sampler = generate_backwards_sampler(trace, [(:data => i => :z) for i in 1:n])
+    for i in 1:100
+        trace, acc = mh(trace, sampler, ())
+        @test acc
+        trace, _ = mh(trace, select(:inlier_mean))
+    end
+end
+
+
+##########
+# Unfold #
+##########
+
+# three hidden states, three observed states
+prior = rand(3)
+prior = prior / sum(prior)
+
+A = rand(3, 3)
+A = A ./ sum(A, dims=2)
+
+B = rand(3, 3)
+B = B ./ sum(B, dims=2)
+
+@gen (static) function step(t::Int, z_prev::Int)
+    z ~ categorical(A[z_prev,:])
+    x ~ categorical(B[z,:])
+    return z
+end
+
+@gen (static) function hmm(T::Int)
+    z_init ~ categorical(prior)
+    x_init ~ categorical(B[z_init,:])
+    steps ~ (Unfold(step))(T, z_init)
+end
+
+@load_generated_functions()
+
+@testset "Unfold" begin
+
+    trace = simulate(hmm, (10,))
+
+    (ret_ancestors, latents, observations) = factor_graph_analysis(
+        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z], (), [Set{Any}()])
+    
+    sampler = generate_backwards_sampler(trace, [:z_init, (:steps => t => :z for t in 1:10)...])
+    for i in 1:100
+        trace, acc = mh(trace, sampler, ())
+        @test acc
+    end
+
+end
+
+@testset "generate backwards sampler fixed trace" begin
+    T = 10
+    trace = simulate(hmm, (T,))
+    observations = choicemap()
+    observations[:x_init] = trace[:x_init]
+    for t in 1:T
+        observations[:steps => t => :x] = trace[:steps => t => :x]
+    end
+
+    sampler = generate_backwards_sampler_fixed_trace(trace, [:z_init, (:steps => t => :z for t in 1:T)...])
+
+    # since sampler is the exact conditional distribution, importance sampling
+    # yields deterministic exact log marginal likelihood
+    q_tr1 = simulate(sampler, ())
+    p_tr1, = generate(hmm, (T,), merge(observations, get_choices(q_tr1)))
+    q_tr2 = simulate(sampler, ())
+    p_tr2, = generate(hmm, (T,), merge(observations, get_choices(q_tr2)))
+    logml1 = get_score(p_tr1) - get_score(q_tr1)
+    logml2 = get_score(p_tr2) - get_score(q_tr2)
+    @test isapprox(logml1, logml2)
+end

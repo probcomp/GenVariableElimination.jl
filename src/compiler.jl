@@ -243,7 +243,27 @@ function factor_graph_analysis(trace::Gen.VectorTrace{Gen.UnfoldType}, addrs, cu
 end
 
 function factor_graph_analysis(trace::Gen.VectorTrace{Gen.MapType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
-    # TODO
+    gen_fn = get_gen_fn(trace)
+    kernel = gen_fn.kernel
+
+    if length(trace.subtraces) == 0
+        return (Set{Any}(), Dict{Any,Latent}(), Dict{Any,Observation}())
+    end
+
+    node_to_ancestor_addrs = Dict{Int,Set{Any}}()
+    latents = Dict{Any,Latent}()
+    observations = Dict{Any,Observation}()
+
+    for t in 1:length(trace.subtraces)
+        (node_to_ancestor_addrs[t], call_latents, call_observations) = factor_graph_analysis(
+                    trace.subtraces[t],
+                    addrs, (cur_namespace..., t),
+                    arg_ancestor_addrs)
+        merge!(latents, call_latents)
+        merge!(observations, call_observations)
+    end
+
+    return (union(values(node_to_ancestor_addrs)...), latents, observations)
 end
 
 function factor_graph_analysis(trace, addrs)
