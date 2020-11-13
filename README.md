@@ -2,7 +2,7 @@
 
 [![Build Status](https://travis-ci.com/probcomp/GenVariableElimination.jl.svg?branch=main)](https://travis-ci.com/probcomp/GenVariableElimination.jl)
 
-WARNING: This package is experimental. The API is not stable, and it has not been not performance-tuned.
+WARNING: This package is experimental. The API is not stable, and it has not been not performance-tuned. The implementation has performance issues when the number of variables increases above ~30. (The performance issues are not due to problems with algorithmic complexity, but appear to involve the specific way that factor computations are currently implemented.)
 
 This package includes several components:
 
@@ -52,6 +52,7 @@ end
 ```
 
 We start with the highest-level API, and then subsequent sections describe the internals, using these generative functions as examples.
+See `examples/regression.jl` for another example.
 
 ## Sampling from the conditional distribution on selected random choices
 
@@ -110,6 +111,8 @@ for iter in 1:100
     @assert acc
 end
 ```
+
+**Note**: [Gen.mh](https://www.gen.dev/dev/ref/mcmc/#Gen.metropolis_hastings) when used with a proposal of this form should always accept, since it is equivalent to Gibbs sampling. In some extreme cases where the proposal is nearly deterministic, numerical issues may cause rejections.
 
 DML example:
 
