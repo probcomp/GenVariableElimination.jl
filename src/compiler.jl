@@ -143,79 +143,12 @@ function compile_trace_to_factor_graph(
     return FactorGraph{N}(num_factors, var_nodes, latent_addr_to_idx)
 end
 
-###################
-# static analysis #
-###################
+###########################################################
+# generation of factor graph from static IR + combinators #
+###########################################################
 
-#function generate_factor_graph_template(trace, addrs, domains)
-    # generate the factor graph, but don't populate the factors yet...
-    # this could involve generating a Julia function for each factor
-    # that computes its value from the trace?
-#end 
-
-# this is the key thing that needs to happen efficiently...
-
-# note that factors can cross boundaries of generative functions..
-# e.g. a static IR function that calls two other Static IR functions
-# (or, e.g. unfold)
-
-# perhaps the first step is to generate a flat Bayesian network representation?
-# (where only latent variables and downstream variables are included?)
-
-# and then generate the factor graph from that..
-
-#function generate_flat_bayesian_network(trace, addrs)
-    # each node will need to be labeled with its addr (which also defines
-    # where in the IR computation graph / trace it is..)
-    # Q: if you return multiple outputs, are the independencies tracked separately?
-    # the nodes should also be arranged hierarchically?
-
-    # we need to compute the set of observed random variables, and their parents..
-    # this requires an inter-procedural graph analysis, where we propagate
-    # through the computation graph and stop at random choices (also
-    # propagating the set of parents at each stage via union), then the set of
-    # random choices that we stop at are the 'observations' for the purposes of
-    # this analysis
-
-    # we also need to determine what latent random variables depend on what others..
-
-    # both of these can be achieved by a propagation along the
-    # (inter-procedural) computation graph; which seems like a general operation..
-
-    # 1. do propagation in the inter-procedural flat computation graph
-    # 2. populate factors, or generate code for populating factors...
-    #    (in general, this will involve
-    #           (a) iterating over all values in the cartesian product of parents and
-    #           (b) for each tuple of values, computing the arguments to the distribution, and
-    #           (c) calling Gen.logpdf for each one
-    # (b) is the challenging part..
-
-    # after we have that information, we need to populate the factors
-    # this involves enumerating over all the values of all of the parents
-    # and re-executing small chunks of the SML function to compute logpdfs
-
-    # maybe the Static IR (+combinators) should support a query of the form:
-    # (i) get parents and get probability density of child given parents
-    # we really need to enumerate over all values of the parents, and for each one,
-    # query the probability of the child
-
-    # the purpose of this is to make it easier to generate the factors..
-
-    # for the initial version, maybe we should use use the Static IR to compute the
-    # latents and observations, and just use `update' and `project' as before?
-    # we could also add a new (optional) method to the GFI which returns conditional densities given parents
-    # would need to define its semantics..
-
-#end
-
-# NOTE:
-# a big part of this is changing where the code goes.
-# instead of all the code going with the modeling language or the combinatoars
-# and instead of exposing a huge API
-# we instead expose a simpler but much more flexible API (for the IR itself)
-# and then all the code gets written outside in separate modules, instead of split up between modeling components themselves..
-
-function forward_analysis(trace::StaticIRTrace, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
+function factor_graph_analysis(
+        trace::StaticIRTrace, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
     ir = Gen.get_ir(Gen.get_gen_fn_type(typeof(trace)))
     node_to_ancestor_addrs = Dict{Any,Set{Any}}()
     for (node, arg_ancestors) in zip(ir.arg_nodes, arg_ancestor_addrs)
@@ -237,7 +170,7 @@ function forward_analysis(trace::StaticIRTrace, addrs, cur_namespace, arg_ancest
         elseif isa(node, Gen.RandomChoiceNode)
             this_addr = foldr(=>, [cur_namespace..., node.addr])
             if this_addr in addrs
-                domain = [Gen.discrete_finite_support_overapprox(
+                domain = [discrete_finite_support_overapprox(
                     node.dist, (getproperty(trace, Gen.get_value_fieldname(n)) for n in node.inputs)...)...]
                 if length(node.inputs) == 0
                     latents[this_addr] = Latent(domain, Any[])
@@ -257,7 +190,7 @@ function forward_analysis(trace::StaticIRTrace, addrs, cur_namespace, arg_ancest
                 node_to_ancestor_addrs[node] = Set{Any}()
             end
         elseif isa(node, Gen.GenerativeFunctionCallNode)
-            (node_to_ancestor_addrs[node], call_latents, call_observations) = forward_analysis(
+            (node_to_ancestor_addrs[node], call_latents, call_observations) = factor_graph_analysis(
                 Gen.static_get_subtrace(trace, Val(node.addr)),
                 addrs, (cur_namespace..., node.addr),
                 Set{Any}[node_to_ancestor_addrs[n] for n in node.inputs])
@@ -270,7 +203,7 @@ function forward_analysis(trace::StaticIRTrace, addrs, cur_namespace, arg_ancest
     return (node_to_ancestor_addrs[ir.return_node], latents, observations)
 end
 
-function forward_analysis(trace::Gen.VectorTrace{Gen.UnfoldType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
+function factor_graph_analysis(trace::Gen.VectorTrace{Gen.UnfoldType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
     gen_fn = get_gen_fn(trace)
     kernel = gen_fn.kernel
     n_ancestor_addrs = arg_ancestor_addrs[1]
@@ -297,7 +230,7 @@ function forward_analysis(trace::Gen.VectorTrace{Gen.UnfoldType}, addrs, cur_nam
     prev_state_ancestor_addrs = init_state_ancestor_addrs
 
     for t in 1:length(trace.subtraces)
-        (node_to_ancestor_addrs[t], call_latents, call_observations) = forward_analysis(
+        (node_to_ancestor_addrs[t], call_latents, call_observations) = factor_graph_analysis(
                     trace.subtraces[t],
                     addrs, (cur_namespace..., t),
                     [Set{Any}(), prev_state_ancestor_addrs, params_ancestor_addrs...])
@@ -309,33 +242,67 @@ function forward_analysis(trace::Gen.VectorTrace{Gen.UnfoldType}, addrs, cur_nam
     return (union(values(node_to_ancestor_addrs)...), latents, observations)
 end
 
-function forward_analysis(trace::Gen.VectorTrace{Gen.MapType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
+function factor_graph_analysis(trace::Gen.VectorTrace{Gen.MapType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
     # TODO
+end
+
+function factor_graph_analysis(trace, addrs)
+    return factor_graph_analysis(trace, addrs, (), Set{Any}[Set{Any}() for _ in get_args(trace)])
 end
 
 @dist labeled_cat(labels, probs) = labels[categorical(probs)]
 
-function generate_conditional_sampler(trace::StaticIRTrace, addrs)
+@gen function ve_backwards_sampler(latents, fg, ve_result)
+    N = length(latents)
+    values = Vector{Any}(undef, N)
+    for addr in reverse(ve_result.elimination_order)
+        var_idx = addr_to_idx(fg, addr)
+        fg = ve_result.intermediate_fgs[var_idx]
+        dist = conditional_dist(fg, values, addr)
+        value = ({addr} ~ labeled_cat(latents[addr].domain, dist))
+        values[var_idx] = value
+    end
+end
 
-    # NOTE: we could stage the computation better, so less is done within the generative function at runtime
-    # NOTE: could also generate one that was specialized to the specific values in this trace?
-    # NOTE: we could emit static IR instead of DML code
-    println("doing forward analysis...")
-    @time (_, latents, observations) = forward_analysis(trace, addrs, (), Set{Any}[Set{Any}() for _ in get_args(trace)])
- 
-    @gen function ve_sampler(trace)
+# NOTE: we could stage the computation better, so less is done within the
+# generative function at runtime
+# NOTE: could also generate one that was specialized to the specific values in this trace?
+# NOTE: we could emit static IR instead of DML code
+
+"""
+    sampler::GenerativeFunction = generate_backwards_sampler_fixed_trace(trace, addrs)
+
+Generate a generative function that takes no arguments that samples from the conditional distribution on the given addresses.
+
+The addresses must be discrete random choices within finite support and must not affect the control flow in the trace.
+The sampler is generated using variable elimination followed by backwards sampling, where the order of the provided addresses defines the elimination order.
+The sampler takes no arguments and is specialized to the conditional distribution for the given trace.
+"""
+function generate_backwards_sampler_fixed_trace(trace, addrs)
+    (_, latents, observations) = factor_graph_analysis(trace, addrs)
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+    ve_result = variable_elimination(fg, addrs)
+    @gen function sampler()
+        {*} ~ ve_backwards_sampler(latents, fg, ve_result)
+    end
+    return sampler
+end
+
+"""
+    sampler::GenerativeFunction = generate_backwards_sampler(trace, addrs)
+
+Generate a generative function that takes a trace argument that samples from the conditional distribution on the given addresses.
+
+The addresses must be discrete random choices within finite support and must not affect the control flow in the trace.
+The sampler is generated using variable elimination followed by backwards sampling, where the order of the provided addresses defines the elimination order.
+The sampler is specialized to traces with the same control flow path, but not necessarily the same values, as the trace provided to the generation function.
+"""
+function generate_backwards_sampler(trace, addrs)
+    (_, latents, observations) = factor_graph_analysis(trace, addrs)
+    @gen function sampler(trace)
         fg = compile_trace_to_factor_graph(trace, latents, observations)
-        elimination_result = variable_elimination(fg, addrs)
-        N = length(latents)
-        values = Vector{Any}(undef, N)
-        for addr in reverse(elimination_result.elimination_order)
-            var_idx = addr_to_idx(fg, addr)
-            fg = elimination_result.intermediate_fgs[var_idx]
-            dist = conditional_dist(fg, values, addr)
-            value = ({addr} ~ labeled_cat(latents[addr].domain, dist))
-            values[var_idx] = value
-        end
-    end   
-
-    return ve_sampler
+        ve_result = variable_elimination(fg, addrs)
+        {*} ~ ve_backwards_sampler(latents, fg, ve_result)
+    end
+    return sampler
 end

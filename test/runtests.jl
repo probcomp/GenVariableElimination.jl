@@ -78,40 +78,56 @@ end
 
 @load_generated_functions()
 
-#@testset "static IR basic block" begin
-#
-    #trace = simulate(static_model, ())
-#
-    #(ret_ancestors, latents, observations) = GenVariableElimination.forward_analysis(
-        #trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
-    #println(ret_ancestors)
-    #println(latents)
-    #println(observations)
-    #
-    #sampler = generate_conditional_sampler(trace, [:x1, :x2, :x3])
-    #for i in 1:100
-        #@time trace, acc = mh(trace, sampler, ())
-        #@test acc
-    #end
-#
-#end
+@testset "static IR basic block" begin
 
-@testset "static IR + unfold HMM" begin
+    trace = simulate(static_model, ())
 
-    trace = simulate(hmm, (20,))
-
-    (ret_ancestors, latents, observations) = GenVariableElimination.forward_analysis(
-        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z], (), [Set{Any}()])
-    println(ret_ancestors)
-    println(latents)
-    println(observations)
+    (ret_ancestors, latents, observations) = factor_graph_analysis(
+        trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
     
-    sampler = generate_conditional_sampler(trace, [:z_init, (:steps => t => :z for t in 1:20)...])
+    sampler = generate_backwards_sampler(trace, [:x1, :x2, :x3])
     for i in 1:100
-        @time trace, acc = mh(trace, sampler, ())
+        trace, acc = mh(trace, sampler, ())
         @test acc
     end
 
+end
+
+@testset "static IR + unfold HMM" begin
+
+    trace = simulate(hmm, (10,))
+
+    (ret_ancestors, latents, observations) = factor_graph_analysis(
+        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z], (), [Set{Any}()])
+    
+    sampler = generate_backwards_sampler(trace, [:z_init, (:steps => t => :z for t in 1:10)...])
+    for i in 1:100
+        trace, acc = mh(trace, sampler, ())
+        @test acc
+    end
+
+end
+
+@testset "generate backwards sampler fixed trace" begin
+    T = 10
+    trace = simulate(hmm, (T,))
+    observations = choicemap()
+    observations[:x_init] = trace[:x_init]
+    for t in 1:T
+        observations[:steps => t => :x] = trace[:steps => t => :x]
+    end
+
+    sampler = generate_backwards_sampler_fixed_trace(trace, [:z_init, (:steps => t => :z for t in 1:T)...])
+
+    # since sampler is the exact conditional distribution, importance sampling
+    # yields deterministic exact log marginal likelihood
+    q_tr1 = simulate(sampler, ())
+    p_tr1, = generate(hmm, (T,), merge(observations, get_choices(q_tr1)))
+    q_tr2 = simulate(sampler, ())
+    p_tr2, = generate(hmm, (T,), merge(observations, get_choices(q_tr2)))
+    logml1 = get_score(p_tr1) - get_score(q_tr1)
+    logml2 = get_score(p_tr2) - get_score(q_tr2)
+    @test isapprox(logml1, logml2)
 end
 
 # end #
