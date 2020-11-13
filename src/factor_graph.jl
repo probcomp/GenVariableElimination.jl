@@ -55,13 +55,13 @@ function factor_value(fg::FactorGraph, node::FactorNode{N}, values::Dict) where 
     return exp.(node.log_factor[idxs...])
 end
 
-function draw_factor_graph(fg::FactorGraph, graphviz, fname)
+function draw_factor_graph(fg::FactorGraph, graphviz, fname, addr_to_name)
     dot = graphviz.Digraph()
     factor_idx = 1
     for node in values(fg.var_nodes)
         shape = "ellipse"
         color = "white"
-        name = replace(replace(replace(string(addr(node)), "=>" => "_"), "(" => ""), ")" => "")
+        name = addr_to_name(addr(node))
         dot[:node](name, name, shape=shape, fillcolor=color, style="filled")
         for factor_node in factor_nodes(node)
             shape = "box"

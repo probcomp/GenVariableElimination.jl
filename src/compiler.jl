@@ -142,3 +142,167 @@ function compile_trace_to_factor_graph(
     end
     return FactorGraph{N}(num_factors, var_nodes, latent_addr_to_idx)
 end
+
+###########################################################
+# generation of factor graph from static IR + combinators #
+###########################################################
+
+function factor_graph_analysis(
+        trace::StaticIRTrace, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
+    ir = Gen.get_ir(Gen.get_gen_fn_type(typeof(trace)))
+    node_to_ancestor_addrs = Dict{Any,Set{Any}}()
+    for (node, arg_ancestors) in zip(ir.arg_nodes, arg_ancestor_addrs)
+        node_to_ancestor_addrs[node] = arg_ancestors
+    end
+    latents = Dict{Any,Latent}()
+    observations = Dict{Any,Observation}()
+    for node in ir.nodes
+        if isa(node, Gen.TrainableParameterNode)
+            node_to_ancestor_addrs[node] = Set{Any}()
+        elseif isa(node, Gen.ArgumentNode)
+            # already handled above during initialization
+        elseif isa(node, Gen.JuliaNode)
+            if length(node.inputs) == 0
+                node_to_ancestor_addrs[node] = Set{Any}()
+            else
+                node_to_ancestor_addrs[node] = union((node_to_ancestor_addrs[n] for n in node.inputs)...)
+            end
+        elseif isa(node, Gen.RandomChoiceNode)
+            this_addr = foldr(=>, [cur_namespace..., node.addr])
+            if this_addr in addrs
+                domain = [discrete_finite_support_overapprox(
+                    node.dist, (getproperty(trace, Gen.get_value_fieldname(n)) for n in node.inputs)...)...]
+                if length(node.inputs) == 0
+                    latents[this_addr] = Latent(domain, Any[])
+                else
+                    latents[this_addr] = Latent(domain, Any[union((node_to_ancestor_addrs[n] for n in node.inputs)...)...])
+                end
+                node_to_ancestor_addrs[node] = Set{Any}([this_addr]) # its value only depends on itself..
+            else
+                if length(node.inputs) == 0
+                    observations[this_addr] = Observation(Any[])
+                else
+                    ancestor_addrs = union((node_to_ancestor_addrs[n] for n in node.inputs)...)
+                    if !isempty(ancestor_addrs)
+                        observations[this_addr] = Observation(Any[ancestor_addrs...])
+                    end
+                end
+                node_to_ancestor_addrs[node] = Set{Any}()
+            end
+        elseif isa(node, Gen.GenerativeFunctionCallNode)
+            (node_to_ancestor_addrs[node], call_latents, call_observations) = factor_graph_analysis(
+                Gen.static_get_subtrace(trace, Val(node.addr)),
+                addrs, (cur_namespace..., node.addr),
+                Set{Any}[node_to_ancestor_addrs[n] for n in node.inputs])
+            merge!(latents, call_latents)
+            merge!(observations, call_observations)
+        else
+            @assert false
+        end
+    end
+    return (node_to_ancestor_addrs[ir.return_node], latents, observations)
+end
+
+function factor_graph_analysis(trace::Gen.VectorTrace{Gen.UnfoldType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
+    gen_fn = get_gen_fn(trace)
+    kernel = gen_fn.kernel
+    n_ancestor_addrs = arg_ancestor_addrs[1]
+    init_state_ancestor_addrs = arg_ancestor_addrs[2]
+    params_ancestor_addrs = arg_ancestor_addrs[3:end]
+    !isempty(n_ancestor_addrs) && error("the selected addresses may not modify the structure of the trace")
+
+    # NOTE: we do an analysis of the inner static generative function, then we copy the results?
+    # or a few analyses, interestingly..
+
+    # note: we could require them to do 'All' here, just to simplify the analysis?
+    # but this is overly restrictive..
+
+    # TODO: Note that this analysis can be done without visiting all nodes
+    # (this is interetsingly related to fixed points)
+
+    if length(trace.subtraces) == 0
+        return (Set{Any}(), Dict{Any,Latent}(), Dict{Any,Observation}())
+    end
+    
+    node_to_ancestor_addrs = Dict{Int,Set{Any}}()
+    latents = Dict{Any,Latent}()
+    observations = Dict{Any,Observation}()
+    prev_state_ancestor_addrs = init_state_ancestor_addrs
+
+    for t in 1:length(trace.subtraces)
+        (node_to_ancestor_addrs[t], call_latents, call_observations) = factor_graph_analysis(
+                    trace.subtraces[t],
+                    addrs, (cur_namespace..., t),
+                    [Set{Any}(), prev_state_ancestor_addrs, params_ancestor_addrs...])
+        prev_state_ancestor_addrs = node_to_ancestor_addrs[t]
+        merge!(latents, call_latents)
+        merge!(observations, call_observations)
+    end
+
+    return (union(values(node_to_ancestor_addrs)...), latents, observations)
+end
+
+function factor_graph_analysis(trace::Gen.VectorTrace{Gen.MapType}, addrs, cur_namespace, arg_ancestor_addrs::Vector{Set{Any}})
+    # TODO
+end
+
+function factor_graph_analysis(trace, addrs)
+    return factor_graph_analysis(trace, addrs, (), Set{Any}[Set{Any}() for _ in get_args(trace)])
+end
+
+@dist labeled_cat(labels, probs) = labels[categorical(probs)]
+
+@gen function ve_backwards_sampler(latents, fg, ve_result)
+    N = length(latents)
+    values = Vector{Any}(undef, N)
+    for addr in reverse(ve_result.elimination_order)
+        var_idx = addr_to_idx(fg, addr)
+        fg = ve_result.intermediate_fgs[var_idx]
+        dist = conditional_dist(fg, values, addr)
+        value = ({addr} ~ labeled_cat(latents[addr].domain, dist))
+        values[var_idx] = value
+    end
+end
+
+# NOTE: we could stage the computation better, so less is done within the
+# generative function at runtime
+# NOTE: could also generate one that was specialized to the specific values in this trace?
+# NOTE: we could emit static IR instead of DML code
+
+"""
+    sampler::GenerativeFunction = generate_backwards_sampler_fixed_trace(trace, addrs)
+
+Generate a generative function that takes no arguments that samples from the conditional distribution on the given addresses.
+
+The addresses must be discrete random choices within finite support and must not affect the control flow in the trace.
+The sampler is generated using variable elimination followed by backwards sampling, where the order of the provided addresses defines the elimination order.
+The sampler takes no arguments and is specialized to the conditional distribution for the given trace.
+"""
+function generate_backwards_sampler_fixed_trace(trace, addrs)
+    (_, latents, observations) = factor_graph_analysis(trace, addrs)
+    fg = compile_trace_to_factor_graph(trace, latents, observations)
+    ve_result = variable_elimination(fg, addrs)
+    @gen function sampler()
+        {*} ~ ve_backwards_sampler(latents, fg, ve_result)
+    end
+    return sampler
+end
+
+"""
+    sampler::GenerativeFunction = generate_backwards_sampler(trace, addrs)
+
+Generate a generative function that takes a trace argument that samples from the conditional distribution on the given addresses.
+
+The addresses must be discrete random choices within finite support and must not affect the control flow in the trace.
+The sampler is generated using variable elimination followed by backwards sampling, where the order of the provided addresses defines the elimination order.
+The sampler is specialized to traces with the same control flow path, but not necessarily the same values, as the trace provided to the generation function.
+"""
+function generate_backwards_sampler(trace, addrs)
+    (_, latents, observations) = factor_graph_analysis(trace, addrs)
+    @gen function sampler(trace)
+        fg = compile_trace_to_factor_graph(trace, latents, observations)
+        ve_result = variable_elimination(fg, addrs)
+        {*} ~ ve_backwards_sampler(latents, fg, ve_result)
+    end
+    return sampler
+end
