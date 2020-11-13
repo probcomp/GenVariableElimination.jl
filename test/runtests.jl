@@ -287,9 +287,9 @@ end
     trace = simulate(foo, ())
 
     function mh_log_acceptance_ratio(trace)
-        forward_trace = simulate(compile_and_sample_factor_graph, (trace, latents, observations, elimination_order))
+        forward_trace = simulate(backwards_sampler_dml, (trace, elimination_order, latents, observations))
         (new_trace, weight, _, discard) = update(trace, get_args(trace), map((_) -> NoChange(), get_args(trace)), get_choices(forward_trace))
-        (backward_trace, _) = generate(compile_and_sample_factor_graph, (trace, latents, observations, elimination_order), discard)
+        (backward_trace, _) = generate(backwards_sampler_dml, (trace, elimination_order, latents, observations), discard)
         return weight + get_score(backward_trace) - get_score(forward_trace)
     end
 
@@ -342,7 +342,7 @@ end
 
     for i in 1:10
         # NOTE: in this case, it is actually unecessary to recompile the factor graph on each iteration
-        trace, accepted = mh(trace, compile_and_sample_factor_graph, (latents, observations, elimination_order))
+        trace, accepted = mh(trace, backwards_sampler_dml, (elimination_order, latents, observations))
         @test accepted
     end
 
@@ -393,9 +393,14 @@ end
     (ret_ancestors, latents, observations) = factor_graph_analysis(
         trace, [:x1, :x2, :x3, :x4, :x5, :x6, :x7, :x8], (), [Set{Any}()])
     
-    sampler = generate_backwards_sampler(trace, [:x1, :x2, :x3])
+    sampler = generate_backwards_sampler_fixed_structure(trace, [:x1, :x2, :x3])
     for i in 1:100
         trace, acc = mh(trace, sampler, ())
+        @test acc
+    end
+
+    for i in 1:100
+        trace, acc = mh(trace, backwards_sampler_sml, ([:x1, :x2, :x3],))
         @test acc
     end
 
@@ -421,7 +426,7 @@ end
 @testset "Map" begin
     n = 10
     trace = simulate(global_model, (n,))
-    sampler = generate_backwards_sampler(trace, [(:data => i => :z) for i in 1:n])
+    sampler = generate_backwards_sampler_fixed_structure(trace, [(:data => i => :z) for i in 1:n])
     for i in 1:100
         trace, acc = mh(trace, sampler, ())
         @test acc
@@ -463,9 +468,9 @@ end
     trace = simulate(hmm, (10,))
 
     (ret_ancestors, latents, observations) = factor_graph_analysis(
-        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z], (), [Set{Any}()])
+        trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z])
     
-    sampler = generate_backwards_sampler(trace, [:z_init, (:steps => t => :z for t in 1:10)...])
+    sampler = generate_backwards_sampler_fixed_structure(trace, [:z_init, (:steps => t => :z for t in 1:10)...])
     for i in 1:100
         trace, acc = mh(trace, sampler, ())
         @test acc

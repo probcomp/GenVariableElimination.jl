@@ -1,26 +1,28 @@
 # GenVariableElimination.jl
 
-WARNING: This package is experimental research code.
+WARNING: This package is experimental research code. The API is not stable, and it has not been not performance-tuned.
 
 This package includes several components:
 
-- A procedure for compiling a factor graph from a trace of a [Gen](https://www.gen.dev) generative function
+- Procedures for compiling factor graphs from traces [Gen.jl](https://www.gen.dev) generative functions.
 
 - An implementation of variable elimination for factor graphs
 
 - Generative functions that sample from the exact joint distribution which is obtained via variable elimination in a factor graph
 
-## Compiling a factor graph from a trace of a generative function
+This package can compile factor graphs from traces of generative functions that are constructed using either [Gen Dynamic Modeling Language](https://www.gen.dev/dev/ref/modeling/) (DML),
+or using the [Gen Static Modeling Language](https://www.gen.dev/dev/ref/modeling/#Static-Modeling-Language-1) (SML) together with built-in [control-flow combinators](https://www.gen.dev/dev/ref/combinators/).
+When compiling from traces of DML generative functions, the user needs to provide extra information about the dependencies between random choices in the trace, and the domains of the choices.
+When compiling from traces of SML + combinators generative function, this information is automatically extracted from the model.
 
-Consider the following generative function, which implements a hidden Markov model:
-
+Consider the following DML generative function, which implements a hidden Markov model:
 ```julia
 prior = rand(3); prior = prior / sum(prior)
 A = rand(3, 3); A = A ./ sum(A, dims=2)
 B = rand(3, 3); B = B ./ sum(B, dims=2)
 T = 10
 
-@gen function hmm()
+@gen function dml_hmm(T::Int)
     z = ({(:z, 1)} ~ categorical(prior))
     {(:x, 1)} ~ categorical(B[z,:])
     for t in 2:T
@@ -29,28 +31,115 @@ T = 10
     end
 end
 ```
-
 This model contains discrete random variables for each hidden and observed state.
-Conditioned on the values of observed random choices, the hidden state random variables have conditional independencies that can be expressed in the following chain-shaped factor graph:
+Conditioned on the values of observed random choices, the hidden state random variables have conditional independencies that can be expressed in a chain-shaped factor graph.
 
-TODO
+Consider the following similar generative function constructed with SML and the Unfold combinator:
+```julia
+@gen (static) function step(t::Int, z_prev::Int)
+    z ~ categorical(A[z_prev,:])
+    x ~ categorical(B[z,:])
+    return z
+end
 
-To generative this factor graph from a trace, we use use the following code.
+@gen (static) function sml_hmm(T::Int)
+    z_init ~ categorical(prior)
+    x_init ~ categorical(B[z_init,:])
+    steps ~ (Unfold(step))(T-1, z_init)
+end
+```
+
+We start with the highest-level API, and then subsequent sections describe the internals, using these generative functions as examples.
+
+## Sampling from the conditional distribution on selected random choices
+
+The package provides generative functions that sample from the exact conditional joint distribution on selected latent variables, at the same addresses as in the original source generative function.
+This makes it possible to employ this the sampler within the context of other Gen inference code algorithms, like MCMC or SMC.
+
+The first function returns a generative function that takes no arguments, and samples from the joint conditional distribution on the given set of addresses, which define the set of addresses to sample and the elimination order to use.
+There are two variants of this function.
+The first applies to SML + combinator traces only, and the second applies to DML traces, but requires the user to provide additional information.
+
+    generate_backwards_sampler_fixed_trace(trace, addresses)
+    generate_backwards_sampler_fixed_trace(trace, addresses, latents, observations)
+
+SML example:
+
+    trace = simulate(sml_hmm, (10,))
+    sampler = generate_backwards_sampler_fixed_trace(trace, [:z_init, (:steps => t => :z for t in 1:9)...])
+
+The second function only applies to SML + combinator generative functions, and returns a generative function that takes one argument, which is another trace of the model that takes the same control-flow path as the original trace passed at generation time.
+This function does analysis of the structure of the trace only once, instead of within the returned generative function.
+
+    generate_backwards_sampler_fixed_structure(trace, addresses)
+
+SML example:
+
+    trace = simulate(sml_hmm, (10,))
+    sampler = generate_backwards_sampler_fixed_structure(trace, [:z_init, (:steps => t => :z for t in 1:9)...])
+
+Finally, this package also defines two generative functions that take as input the trace and addresses at runtime.
+
+    backwards_sampler_sml(trace, addresses)
+    backwards_sampler_dml(trace, addresses, latents, observations)
+
+SML example:
+
+    trace = simulate(sml_hmm, (10,))
+
+    for iter in 1:100
+        trace, acc = mh(trace, backwards_sampler_sml, ([:z_init, (:steps => t => :z for t in 1:9)...],))
+        @assert acc
+    end
+
+DML example:
+
+    latents = Dict{Any,Latent}()
+    latents[(:z, 1)] = Latent(collect(1:3), [])
+    for t in 2:T
+        latents[(:z, t)] = Latent(collect(1:3), [(:z, t-1)])
+    end
+    observations = Dict{Any,Observation}()
+    for t in 1:T
+        observations[(:x, t)] = Observation([(:z, t)])
+    end
+
+    elimination_order = Any[]
+    for t in 1:T
+        push!(elimination_order, (:z, t))
+    end
+    
+    trace = simulate(dml_hmm, (10,))
+
+    for iter in 1:100
+        trace, acc = mh(trace, backwards_sampler_dml, [(:z, t) for t in 1:10], latents, observations)
+        @assert acc
+    end
+
+All of these generative functions employ the same algorithm for sampling from the joint distribution, using the result of variable elimination:
+The variable elimination result actually contains a sequence of factor graphs generated during variable elimination.
+Each random choice is sampled in the reverse order it was eliminated, and the appropriate conditional distribution of each choice given the already sampled choices is computed using the factor graph in the factor graph sequence immediately before the variable was eliminated.
+
+Note that when applied to the HMM, this algorithm, with this particular choice of elimination order, recovers the _forward-filtering backwards sampling_ algorithm.
+
+## Compiling a factor graph from a trace of a generative function
+
+
+To generate the factor graph from the DML trace, we use use the following code.
 This code supplies the structure of the factor graph, and the values will be obtained by querying the trace and its generative function for various conditional probabilities of random choices given their parents:
-
 ```julia
 using GenVariableElimination: Latent, Observation, compile_trace_to_factor_graph
 
-trace = simulate(hmm, ())
+trace = simulate(dml_hmm, (10,))
 
 latents = Dict{Any,Latent}()
 latents[(:z, 1)] = Latent(collect(1:3), [])
-for t in 2:T
+for t in 2:10
     latents[(:z, t)] = Latent(collect(1:3), [(:z, t-1)])
 end
 
 observations = Dict{Any,Observation}()
-for t in 1:T
+for t in 1:10
     observations[(:x, t)] = Observation([(:z, t)])
 end
 
@@ -73,8 +162,10 @@ graphviz = pyimport("graphviz")
 draw_factor_graph(factor_graph, graphviz, "hmm") # creates file "hmm.pdf"
 ```
 
-Currently, the user needs to provide the structure of the factor graph, and the system populates the numeric values of potentials (i.e. factors) through many calls to the `update` method in the trace interface, which be slow.
-Both of these limitations can be potentially (at least partially) resolved by statically analyzing the model code, instead of relying on a combination of human static analysis and black-box probability queries.
+For the SML + Unfold variant of the model, there is a provided analysis that extracts this information automatically:
+```julia
+(_, latents, observations) = factor_graph_analysis(trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z])
+```
 
 ## Running variable elimination
 
@@ -91,37 +182,6 @@ elimination_result = variable_elimination(factor_graph, elimination_order)
 Note that the complexity of variable elimination depends on the elimination order.
 Here, we eliminate the hidden states one by one along the chain, starting with the first hidden state.
 This results in a computation that closely resembles the _forward algorithm_ for HMMs.
-
-## Sampling from the joint distribution of the factor graph
-
-The package also provides generative functions that sample from the exact conditional joint distribution on the latent variables, at the same addresses as in the original source generative function.
-This makes it possible to employ this the sampler within the context of other Gen inference code algorithms.
-
-One generative function takes a trace, latents, observations, and elimination order, and internally compiles the factor graph, and runs variable elimination, and then samples from the resulting full joint distribution.
-Here is an example of it used within Metropolis-Hastings:
-```julia
-using GenVariableElimination: compile_and_sample_factor_graph
-trace = simulate(hmm, ())
-for i in 1:10
-    # NOTE: in this case, it is actually unecessary to recompile the factor graph on each iteration
-    trace, accepted = mh(trace, compile_and_sample_factor_graph, (latents, observations, elimination_order))
-    @test accepted
-end
-```
-
-A second generative function is provided that takes a precompiled factor graph, and the results of running variable elimination.
-This can be much more efficent if you want to sample multiple times from the same joint distribution, as it does not run the (currently somewhat slow) factor graph compilation process each time it is called:
-```julia
-@gen function my_gen_fn()
-    {:ve} ~ sample_factor_graph(factor_graph, elimination_result)
-end
-```
-
-Both generative functions employ the same algorithm for sampling from the joint distribution, using the result of variable elimination:
-The variable elimination result actually contains a sequence of factor graphs generated during variable elimination.
-Each random choice is sampled in the reverse order it was eliminated, and the appropriate conditional distribution of each choice given the already sampled choices is computed using the factor graph in the factor graph sequence immediately before the variable was eliminated.
-
-Note that when applied to the HMM, this algorithm, with this particular choice of elimination order, recovers the forward-filtering backwards sampling.
 
 ## References
 
