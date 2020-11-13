@@ -1,0 +1,12 @@
+# See http://docs.travis-ci.com/user/languages/julia/ and https://juliadocs.github.io/Documenter.jl/stable/man/hosting/#Hosting-Documentation-1
+# See status of Travis builds at https://travis-ci.org/probcomp/Gen2DAgentMotion.jl
+
+language: julia
+julia:
+  - 1.4
+
+jobs:
+  include:
+    - stage: test
+      script:
+        - julia -e 'using Pkg; Pkg.build(); Pkg.test()'
