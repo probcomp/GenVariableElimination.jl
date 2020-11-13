@@ -6,7 +6,7 @@ WARNING: This package is experimental. The API is not stable, and it has not bee
 
 This package includes several components:
 
-- Procedures for compiling factor graphs from traces [Gen.jl](https://www.gen.dev) generative functions.
+- Procedures for compiling factor graphs from [traces](https://www.gen.dev/dev/ref/gfi/#Traces-1) of [Gen.jl](https://www.gen.dev) generative functions.
 
 - An implementation of variable elimination for factor graphs
 
