@@ -8,10 +8,10 @@ This package includes several components:
 
 - An implementation of variable elimination for factor graphs
 
-- Generative functions that sample from the exact joint distribution which is obtained via variable elimination in a factor graph
+- Generative functions that sample from the exact joint conditional distribution on selected discrete random choices, using variable elimination in a factor graph
 
-This package can compile factor graphs from traces of generative functions that are constructed using either [Gen Dynamic Modeling Language](https://www.gen.dev/dev/ref/modeling/) (DML),
-or using the [Gen Static Modeling Language](https://www.gen.dev/dev/ref/modeling/#Static-Modeling-Language-1) (SML) together with built-in [control-flow combinators](https://www.gen.dev/dev/ref/combinators/).
+This package can compile factor graphs from traces of generative functions that are constructed using either (i) [Gen Dynamic Modeling Language](https://www.gen.dev/dev/ref/modeling/) (DML),
+or using (ii) the [Gen Static Modeling Language](https://www.gen.dev/dev/ref/modeling/#Static-Modeling-Language-1) (SML) together with built-in [control-flow combinators](https://www.gen.dev/dev/ref/combinators/).
 When compiling from traces of DML generative functions, the user needs to provide extra information about the dependencies between random choices in the trace, and the domains of the choices.
 When compiling from traces of SML + combinators generative function, this information is automatically extracted from the model.
 
@@ -53,68 +53,88 @@ We start with the highest-level API, and then subsequent sections describe the i
 
 ## Sampling from the conditional distribution on selected random choices
 
-The package provides generative functions that sample from the exact conditional joint distribution on selected latent variables, at the same addresses as in the original source generative function.
+The package provides functions that generate generative functions that sample from the exact conditional joint distribution on selected latent variables, at the same addresses as in the original source generative function.
 This makes it possible to employ this the sampler within the context of other Gen inference code algorithms, like MCMC or SMC.
 
+### Generating samplers specialized to a given trace
 The first function returns a generative function that takes no arguments, and samples from the joint conditional distribution on the given set of addresses, which define the set of addresses to sample and the elimination order to use.
 There are two variants of this function.
 The first applies to SML + combinator traces only, and the second applies to DML traces, but requires the user to provide additional information.
-
-    generate_backwards_sampler_fixed_trace(trace, addresses)
-    generate_backwards_sampler_fixed_trace(trace, addresses, latents, observations)
+```julia
+generate_backwards_sampler_fixed_trace(trace, addresses)
+generate_backwards_sampler_fixed_trace(trace, addresses, latents, observations)
+```
 
 SML example:
+```julia
+trace = simulate(sml_hmm, (10,))
+addresses = [:z_init, (:steps=>t=>:z for t in 1:9)...]
+sampler = generate_backwards_sampler_fixed_trace(trace, addresses)
+sampler_trace = simulate(sampler, ())
+```
 
-    trace = simulate(sml_hmm, (10,))
-    sampler = generate_backwards_sampler_fixed_trace(trace, [:z_init, (:steps => t => :z for t in 1:9)...])
-
+### Generating samplers specialized to the structure of a given trace
 The second function only applies to SML + combinator generative functions, and returns a generative function that takes one argument, which is another trace of the model that takes the same control-flow path as the original trace passed at generation time.
 This function does analysis of the structure of the trace only once, instead of within the returned generative function.
-
-    generate_backwards_sampler_fixed_structure(trace, addresses)
+```julia
+generate_backwards_sampler_fixed_structure(trace, addresses)
+```
 
 SML example:
+```julia
+trace = simulate(sml_hmm, (10,))
+addresses = [:z_init, (:steps=>t=>:z for t in 1:9)...]
+sampler = generate_backwards_sampler_fixed_structure(trace, addresses)
+new_trace, _ = mh(trace, select(:z_init))
+sampler_trace = simulate(sampler, (new_trace,))
+```
 
-    trace = simulate(sml_hmm, (10,))
-    sampler = generate_backwards_sampler_fixed_structure(trace, [:z_init, (:steps => t => :z for t in 1:9)...])
-
+### Samplers that take the trace at run-time
 Finally, this package also defines two generative functions that take as input the trace and addresses at runtime.
 
-    backwards_sampler_sml(trace, addresses)
-    backwards_sampler_dml(trace, addresses, latents, observations)
+```julia
+backwards_sampler_sml(trace, addresses)
+backwards_sampler_dml(trace, addresses, latents, observations)
+```
 
 SML example:
 
-    trace = simulate(sml_hmm, (10,))
+```julia
+trace = simulate(sml_hmm, (10,))
 
-    for iter in 1:100
-        trace, acc = mh(trace, backwards_sampler_sml, ([:z_init, (:steps => t => :z for t in 1:9)...],))
-        @assert acc
-    end
+addresses = [:z_init, (:steps=>t=>:z for t in 1:9)...]
+for iter in 1:100
+    trace, acc = mh(trace, backwards_sampler_sml, (addresses,))
+    @assert acc
+end
+```
 
 DML example:
 
-    latents = Dict{Any,Latent}()
-    latents[(:z, 1)] = Latent(collect(1:3), [])
-    for t in 2:T
-        latents[(:z, t)] = Latent(collect(1:3), [(:z, t-1)])
-    end
-    observations = Dict{Any,Observation}()
-    for t in 1:T
-        observations[(:x, t)] = Observation([(:z, t)])
-    end
+```julia
+latents = Dict{Any,Latent}()
+latents[(:z, 1)] = Latent(collect(1:3), [])
+for t in 2:T
+    latents[(:z, t)] = Latent(collect(1:3), [(:z, t-1)])
+end
+observations = Dict{Any,Observation}()
+for t in 1:T
+    observations[(:x, t)] = Observation([(:z, t)])
+end
 
-    elimination_order = Any[]
-    for t in 1:T
-        push!(elimination_order, (:z, t))
-    end
-    
-    trace = simulate(dml_hmm, (10,))
+elimination_order = Any[]
+for t in 1:T
+    push!(elimination_order, (:z, t))
+end
 
-    for iter in 1:100
-        trace, acc = mh(trace, backwards_sampler_dml, [(:z, t) for t in 1:10], latents, observations)
-        @assert acc
-    end
+trace = simulate(dml_hmm, (10,))
+
+addresses = [(:z, t) for t in 1:10]
+for iter in 1:100
+    trace, acc = mh(trace, backwards_sampler_dml, addresses, latents, observations)
+    @assert acc
+end
+```
 
 All of these generative functions employ the same algorithm for sampling from the joint distribution, using the result of variable elimination:
 The variable elimination result actually contains a sequence of factor graphs generated during variable elimination.
@@ -164,7 +184,8 @@ draw_factor_graph(factor_graph, graphviz, "hmm") # creates file "hmm.pdf"
 
 For the SML + Unfold variant of the model, there is a provided analysis that extracts this information automatically:
 ```julia
-(_, latents, observations) = factor_graph_analysis(trace, [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z])
+addresses = [:z_init, :steps => 1 => :z, :steps => 2 => :z, :steps => 3 => :z]
+(_, latents, observations) = factor_graph_analysis(trace, addresses)
 ```
 
 ## Running variable elimination
