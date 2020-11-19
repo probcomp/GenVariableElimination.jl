@@ -41,6 +41,20 @@ end
 # latent_addrs is the set of latent variables that are involved, which may or
 # may not include the actual addr itself..
 
+#struct Factor{M}
+    #data::Array{Float64,M}
+    #var_to_idx::Vector{Int}
+    #idx_to_var::Vector{Int}
+#end
+
+function new_create_factor(
+        trace, addr, 
+        latents::Dict{Any,Latent}, observations::Dict{Any,Observation},
+        all_latent_addrs::Vector{Any})
+    # TODO
+    return (factor, var_addrs)
+end
+
 function create_factor(
         trace, addr, 
         latents::Dict{Any,Latent}, observations::Dict{Any,Observation},
@@ -116,9 +130,12 @@ function compile_trace_to_factor_graph(
     addr_to_factor_node = Dict{Any,FactorNode{N}}()
     factor_id = 1
     for addr in Iterators.flatten((keys(latents), keys(observations)))
-        (log_factor, var_addrs) = create_factor(
+        #(log_factor, var_addrs) = create_factor(
+            #trace, addr, latents, observations, all_latent_addrs)
+        #addr_to_factor_node[addr] = FactorNode{N}(factor_id, Int[latent_addr_to_idx[a] for a in var_addrs], log_factor)
+        (factor, var_addrs) = create_factor(
             trace, addr, latents, observations, all_latent_addrs)
-        addr_to_factor_node[addr] = FactorNode{N}(factor_id, Int[latent_addr_to_idx[a] for a in var_addrs], log_factor)
+        addr_to_factor_node[addr] = FactorNode{N}(factor_id, Int[latent_addr_to_idx[a] for a in var_addrs], factor)
         factor_id += 1
     end
     num_factors = factor_id - 1

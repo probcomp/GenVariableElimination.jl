@@ -31,14 +31,22 @@ function add_factor_node(node::VarNode{T,V}, factor_node::T) where {T,V}
         node.idx_to_domain, node.domain_to_idx)
 end
 
+struct Factor{M}
+    data::Array{Float64,M}
+    var_to_idx::Vector{Int}
+    idx_to_var::Vector{Int}
+end
+
 struct FactorNode{N} # N is the number of variables in the (original) factor graph
     id::Int
     vars::Vector{Int} # immutable
-    log_factor::Array{Float64,N} # immutable
+    #log_factor::Array{Float64,N} # immutable
+    factor::Factor
 end
 
 vars(node::FactorNode) = node.vars
-get_log_factor(node::FactorNode) = node.log_factor
+#get_log_factor(node::FactorNode) = node.log_factor
+get_factor(node::FactorNode) = node.factor
 
 struct FactorGraph{N}
     num_factors::Int
@@ -87,11 +95,64 @@ addr_to_idx(fg::FactorGraph, addr) = fg.addr_to_idx[addr]
 # all factors are of the same dimension, but with singleton dimensions for
 # variables that are eliminated
 
-function multiply_and_sum(log_factors::Vector{Array{Float64,N}}, idx_to_sum_over::Int) where {N}
-    result = broadcast(+, log_factors...)
-    m = maximum(result, dims=idx_to_sum_over)
-    return m .+ log.(sum(exp.(result .- m), dims=idx_to_sum_over))
+#function multiply_and_sum(log_factors::Vector{Array{Float64,N}}, idx_to_sum_over::Int) where {N}
+    #result = broadcast(+, log_factors...)
+    #m = maximum(result, dims=idx_to_sum_over)
+    #return m .+ log.(sum(exp.(result .- m), dims=idx_to_sum_over))
+#end
+
+function fast_multiply_and_sum(factors, var_to_sum_over::Int, var_dims::Vector{Int})
+
+    # the set of variables are those that appear in any factor
+    # the order in which the variables appear in the factor is arbitrary. we choose one
+    var_to_idx = fill(-1, length(var_dims))
+    next_idx = 1
+    for lf in factors
+        for var in lf.idx_to_var
+            if var_to_idx[var] < 0
+                var_to_idx[var] = next_idx
+                next_idx += 1
+            end
+        end
+    end
+    nvars = next_idx-1
+    idx_to_var = Vector{Int}(undef, nvars)
+    for (var, idx) in enumerate(var_to_idx)
+        if idx > 0
+            idx_to_var[idx] = var
+        end
+    end
+
+    # once the order of the variables is chosen, we can compute the size of the new factor
+    new_factor_size = Int[var_dims[var] for var in idx_to_var]
+
+    # then initialize the new factor
+    data = Array{Float64,nvars}(undef, new_factor_size...)
+
+    # populate the new factor
+    #  loop over entries in the new factor and compute them one by one, by summing
+    var_to_sum_dim = var_dims[var_to_sum_over]
+    var_vals = Vector{Int}(undef, nvars)
+    for i in 1:length(factor)
+        idx_vals = CartesianIndices(factor)[i] # map from the new log factor indices to values
+        for var in 1:nvars
+            var_vals[var] = idx_vals[idx_to_var[var]] # note: unecessary computation here..
+        end
+        total = 0.0
+        for val in 1:var_to_sum_dim
+            prod = 0.0
+            for lf_idx in 1:length(factors)
+                lf = factors[lf_idx]
+                idx = CartesianIndex((var == var_to_sum_over ? val : var_vals[var] for var in lf.idx_to_var)...)
+                prod *= lf.data[idx]
+            end
+            total += prod
+        end
+        data[i] = total
+    end
+    return Factor{nvars}(data, var_to_idx, idx_to_var)
 end
+
 
 function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
     eliminated_var_idx = addr_to_idx(fg, addr)
@@ -119,11 +180,13 @@ function eliminate(fg::FactorGraph{N}, addr::Any) where{N}
     end
 
     # compute the new factor
-    new_log_factor = multiply_and_sum(log_factors_to_combine, eliminated_var_idx)
+    #new_log_factor = multiply_and_sum(log_factors_to_combine, eliminated_var_idx)
+    var_dims = Int[num_values(fg.var_nodes[i]) for i in 1:length(fg.var_nodes)]
+    new_factor = fast_multiply_and_sum(log_factors_to_combine, eliminated_var_idx, var_dims)
 
     # add the new factor node
     new_factor_node = FactorNode{N}(
-        fg.num_factors+1, collect(keys(other_involved_var_nodes)), new_log_factor)
+        fg.num_factors+1, collect(keys(other_involved_var_nodes)), new_factor)#new_log_factor)
     for (other_var_idx, other_var_node) in other_involved_var_nodes
         other_involved_var_nodes[other_var_idx] = add_factor_node(other_var_node, new_factor_node)
     end
@@ -151,19 +214,22 @@ function conditional_dist(fg::FactorGraph{N}, values::Vector{Any}, addr::Any) wh
     # TODO : writing the slow version first..
     # LATER: use generated function to generate a version that is specialized
     # to N? (unroll this loop, and inline the indices..)
-    indices = Vector{Int}(undef, N)
+    #indices = Vector{Int}(undef, N)
     for i in 1:n
         for factor_node in factor_nodes(var_node)
-            log_factor::Array{Float64,N} = get_log_factor(factor_node)
-            fill!(indices, 1)
-            for other_var_idx in vars(factor_node)
-                if other_var_idx != var_idx
-                    other_var_node = idx_to_var_node(fg, other_var_idx)
-                    indices[other_var_idx] = value_to_idx(other_var_node, values[other_var_idx])
-                end
-            end
-            indices[var_idx] = i
-            log_probs[i] += log_factor[CartesianIndex{N}(indices...)]
+            #log_factor::Array{Float64,N} = get_log_factor(factor_node)
+            #fill!(indices, 1)
+            #for other_var_idx in vars(factor_node)
+                #if other_var_idx != var_idx
+                    #other_var_node = idx_to_var_node(fg, other_var_idx)
+                    #indices[other_var_idx] = value_to_idx(other_var_node, values[other_var_idx])
+                #end
+            #end
+            #indices[var_idx] = i
+            #log_probs[i] += log_factor[CartesianIndex{N}(indices...)]
+            factor = get_factor(factor_node)
+            indices = Int[value_to_idx(values[var]) for var in factor.idx_to_var]
+            log_probs[i] += log(factor.data[CartesianIndex(indices...)])
         end
     end
     return exp.(log_probs .- logsumexp(log_probs))
